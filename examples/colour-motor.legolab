@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "name": "Colour Motor",
+  "stacks": [
+    {
+      "pos": [80.0, 60.0],
+      "blocks": [
+        { "id": 1, "type": "when_run" },
+        {
+          "id": 2, "type": "forever",
+          "body": [
+            {
+              "id": 3, "type": "if_else",
+              "condition": { "sensor": "color_is", "color": "Red" },
+              "body": [
+                { "id": 4, "type": "run_motor", "motor": "Single", "direction": "Clockwise", "speed": 100 }
+              ],
+              "else_body": [
+                { "id": 5, "type": "stop_motor", "motor": "Single" }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "pos": [480.0, 60.0],
+      "blocks": [
+        { "id": 6, "type": "when_run" },
+        {
+          "id": 7, "type": "repeat", "count": 4,
+          "body": [
+            { "id": 8, "type": "motor_for_time", "motor": "DoubleBoth", "direction": "Clockwise", "speed": 40, "seconds": 1.0 },
+            { "id": 9, "type": "wait_until", "condition": { "sensor": "button_pressed", "device": "Controller" } }
+          ]
+        }
+      ]
+    }
+  ]
+}
