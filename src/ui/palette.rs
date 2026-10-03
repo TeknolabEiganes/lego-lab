@@ -45,9 +45,15 @@ fn heading(ui: &mut Ui, cat: Category) {
     });
 }
 
-pub fn show(ui: &mut Ui, ed: &mut Editor) {
+pub fn show(ui: &mut Ui, ed: &mut Editor, icons: &super::icons::IconTextures) {
     let palette = BlockKind::palette();
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+            icons.puzzle(ui.painter(), rect.shrink(2.0), theme::TEXT);
+            ui.label(egui::RichText::new("BLOCKS").size(16.0).strong());
+        });
         ui.add_space(6.0);
         for cat in [Category::Events, Category::Motors, Category::Control] {
             heading(ui, cat);

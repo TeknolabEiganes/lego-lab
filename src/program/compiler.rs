@@ -2,8 +2,8 @@
 
 use std::collections::BTreeSet;
 
-use crate::hardware::{DeviceKind, Speed};
-use crate::visual::{Block, BlockId, BlockKind, Workspace, MAX_ROTATIONS, MAX_SECONDS};
+use crate::hardware::{DeviceTarget, Speed};
+use crate::visual::{Block, BlockId, BlockKind, MAX_ROTATIONS, MAX_SECONDS, Workspace};
 
 use super::{Command, Program, Script, Step};
 
@@ -18,7 +18,7 @@ pub struct CompileError {
 pub struct Compiled {
     pub program: Program,
     /// Devices the program needs, so the app can check they are connected.
-    pub devices: BTreeSet<DeviceKind>,
+    pub devices: BTreeSet<DeviceTarget>,
 }
 
 fn seconds_to_ms(seconds: f32) -> u64 {
@@ -27,7 +27,7 @@ fn seconds_to_ms(seconds: f32) -> u64 {
 
 struct Compiler {
     errors: Vec<CompileError>,
-    devices: BTreeSet<DeviceKind>,
+    devices: BTreeSet<DeviceTarget>,
 }
 
 impl Compiler {
@@ -48,30 +48,40 @@ impl Compiler {
                 self.error(block, "“When Run” can only be at the top of a stack.");
                 return None;
             }
-            BlockKind::RunMotor { motor, direction, speed } => {
-                Command::MotorRun { motor, direction, speed: Speed::new(speed as i64) }
-            }
-            BlockKind::StopMotor { motor } => Command::MotorStop { motor },
-            BlockKind::ResetPosition { motor } => Command::MotorResetPosition { motor },
-            BlockKind::MotorForTime { motor, direction, speed, seconds } => {
+            BlockKind::RunMotor { motor, group, direction, speed } => Command::MotorRun {
+                motor,
+                group,
+                direction,
+                speed: Speed::new(speed as i64),
+            },
+            BlockKind::StopMotor { motor, group } => Command::MotorStop { motor, group },
+            BlockKind::ResetPosition { motor, group } => Command::MotorResetPosition { motor, group },
+            BlockKind::MotorForTime { motor, group, direction, speed, seconds } => {
                 if speed <= 0 {
                     self.error(block, "Speed must be more than 0%.");
                     return None;
                 }
                 Command::MotorRunForTime {
                     motor,
+                    group,
                     direction,
                     speed: Speed::new(speed as i64),
                     milliseconds: seconds_to_ms(seconds),
                 }
             }
-            BlockKind::MotorRotations { motor, direction, speed, rotations } => {
+            BlockKind::MotorRotations { motor, group, direction, speed, rotations } => {
                 if speed <= 0 {
                     self.error(block, "Speed must be more than 0%.");
                     return None;
                 }
                 let degrees = (rotations.clamp(0.0, MAX_ROTATIONS) * 360.0).round() as u32;
-                Command::MotorRunForDegrees { motor, direction, speed: Speed::new(speed as i64), degrees }
+                Command::MotorRunForDegrees {
+                    motor,
+                    group,
+                    direction,
+                    speed: Speed::new(speed as i64),
+                    degrees,
+                }
             }
             BlockKind::Wait { seconds } => Command::Wait { milliseconds: seconds_to_ms(seconds) },
             BlockKind::WaitUntil { condition } => Command::WaitUntil { condition },
@@ -89,22 +99,24 @@ impl Compiler {
             },
         };
         if let Some(condition) = block.kind.condition() {
-            self.devices.insert(condition.device());
+            self.devices.insert(condition.target());
         }
-        if let Some(device) = motor_device(&command) {
-            self.devices.insert(device);
+        if let Some(target) = motor_target(&command) {
+            self.devices.insert(target);
         }
         Some(command)
     }
 }
 
-fn motor_device(command: &Command) -> Option<DeviceKind> {
+fn motor_target(command: &Command) -> Option<DeviceTarget> {
     match command {
-        Command::MotorRun { motor, .. }
-        | Command::MotorRunForTime { motor, .. }
-        | Command::MotorRunForDegrees { motor, .. }
-        | Command::MotorStop { motor }
-        | Command::MotorResetPosition { motor } => Some(motor.device()),
+        Command::MotorRun { motor, group, .. }
+        | Command::MotorRunForTime { motor, group, .. }
+        | Command::MotorRunForDegrees { motor, group, .. }
+        | Command::MotorStop { motor, group }
+        | Command::MotorResetPosition { motor, group } => {
+            Some(DeviceTarget { kind: motor.device(), group: *group })
+        }
         _ => None,
     }
 }
@@ -140,7 +152,7 @@ pub fn compile(ws: &Workspace) -> Result<Compiled, Vec<CompileError>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hardware::{Direction, Motor};
+    use crate::hardware::{CardGroup, DeviceKind, Direction, Motor};
     use crate::program::Condition;
 
     #[test]
@@ -152,12 +164,17 @@ mod tests {
         assert_eq!(
             cmds,
             vec![
-                Command::MotorRun { motor: Motor::Single, direction: Direction::Clockwise, speed: Speed::new(50) },
+                Command::MotorRun {
+                    motor: Motor::Single,
+                    group: CardGroup::NoCard,
+                    direction: Direction::Clockwise,
+                    speed: Speed::new(50),
+                },
                 Command::Wait { milliseconds: 2000 },
-                Command::MotorStop { motor: Motor::Single },
+                Command::MotorStop { motor: Motor::Single, group: CardGroup::NoCard },
             ]
         );
-        assert!(c.devices.contains(&DeviceKind::SingleMotor));
+        assert!(c.devices.contains(&DeviceTarget { kind: DeviceKind::SingleMotor, group: CardGroup::NoCard }));
     }
 
     #[test]
@@ -166,11 +183,40 @@ mod tests {
         let c = compile(&ws).unwrap();
         let Command::Forever { body } = &c.program.scripts[0].steps[0].command else { panic!() };
         let Command::If { condition, then, otherwise } = &body[0].command else { panic!() };
-        assert_eq!(*condition, Condition::ColorIs { color: crate::hardware::LegoColor::Red });
+        assert_eq!(*condition, Condition::ColorIs { color: crate::hardware::LegoColor::Red, group: CardGroup::NoCard });
         assert_eq!(then.len(), 1);
         assert_eq!(otherwise.len(), 1);
-        assert!(c.devices.contains(&DeviceKind::ColorSensor));
-        assert!(c.devices.contains(&DeviceKind::SingleMotor));
+        assert!(c.devices.contains(&DeviceTarget { kind: DeviceKind::ColorSensor, group: CardGroup::NoCard }));
+        assert!(c.devices.contains(&DeviceTarget { kind: DeviceKind::SingleMotor, group: CardGroup::NoCard }));
+    }
+
+    #[test]
+    fn compiles_selected_card_group_for_motor_targets() {
+        let mut ws = Workspace::new();
+        let hat = ws.make_block(BlockKind::WhenRun);
+        let run = ws.make_block(BlockKind::RunMotor {
+            motor: Motor::Single,
+            group: CardGroup::Blue,
+            direction: Direction::Clockwise,
+            speed: 50,
+        });
+        ws.add_stack([0.0, 0.0], vec![hat, run]);
+
+        let compiled = compile(&ws).unwrap();
+        assert!(compiled.devices.contains(&DeviceTarget { kind: DeviceKind::SingleMotor, group: CardGroup::Blue }));
+    }
+
+    #[test]
+    fn sensor_condition_requires_its_selected_card_group() {
+        let mut ws = Workspace::new();
+        let hat = ws.make_block(BlockKind::WhenRun);
+        let wait = ws.make_block(BlockKind::WaitUntil {
+            condition: Condition::ColorIs { color: crate::hardware::LegoColor::Red, group: CardGroup::Blue },
+        });
+        ws.add_stack([0.0, 0.0], vec![hat, wait]);
+
+        let compiled = compile(&ws).unwrap();
+        assert!(compiled.devices.contains(&DeviceTarget { kind: DeviceKind::ColorSensor, group: CardGroup::Blue }));
     }
 
     #[test]

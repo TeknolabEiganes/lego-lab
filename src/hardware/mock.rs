@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
 use super::{
-    AttachedDevice, ConnectionState, DeviceKind, Direction, HardwareError, HwResult, LegoColor,
+    AttachedDevice, CardGroup, ConnectionState, DeviceKind, Direction, HardwareError, HwResult, LegoColor,
     LegoDevice, Lever, Motor, SensorQuery, SensorValue, Speed,
 };
 
@@ -43,6 +43,7 @@ pub struct MockState {
     pub connection: ConnectionState,
     /// Which simulated devices are switched on, indexed like `DeviceKind::ALL`.
     pub attached: [bool; 4],
+    pub groups: [CardGroup; 4],
     pub single: MockMotor,
     pub left: MockMotor,
     pub right: MockMotor,
@@ -61,6 +62,7 @@ impl Default for MockState {
         Self {
             connection: ConnectionState::Disconnected,
             attached: [true; 4],
+            groups: [CardGroup::NoCard; 4],
             single: MockMotor::default(),
             left: MockMotor::default(),
             right: MockMotor::default(),
@@ -82,6 +84,14 @@ fn kind_index(kind: DeviceKind) -> usize {
 impl MockState {
     pub fn is_attached(&self, kind: DeviceKind) -> bool {
         self.attached[kind_index(kind)]
+    }
+
+    pub fn group(&self, kind: DeviceKind) -> CardGroup {
+        self.groups[kind_index(kind)]
+    }
+
+    pub fn set_group(&mut self, kind: DeviceKind, group: CardGroup) {
+        self.groups[kind_index(kind)] = group;
     }
 
     pub fn set_attached(&mut self, kind: DeviceKind, on: bool) {
@@ -152,11 +162,11 @@ impl MockState {
         self.motors_mut(motor).into_iter().map(|m| m.speed).collect()
     }
 
-    fn check(&self, kind: DeviceKind) -> HwResult<()> {
+    fn check(&self, kind: DeviceKind, group: CardGroup) -> HwResult<()> {
         if self.connection != ConnectionState::Connected {
             return Err(HardwareError::NotConnected);
         }
-        if !self.is_attached(kind) {
+        if !self.is_attached(kind) || self.group(kind) != group {
             return Err(HardwareError::DeviceMissing(kind));
         }
         Ok(())
@@ -218,19 +228,20 @@ impl MockDevice {
     async fn timed(
         &self,
         motor: Motor,
+        group: CardGroup,
         direction: Direction,
         speed: Speed,
         duration: Duration,
         description: String,
     ) -> HwResult<()> {
         let generations = self.with_state(|s| {
-            s.check(motor.device())?;
+            s.check(motor.device(), group)?;
             s.log(description);
             Ok::<_, HardwareError>(s.set_motor(motor, speed.signed(direction)))
         })?;
         tokio::time::sleep(duration).await;
         self.with_state(|s| {
-            s.check(motor.device())?;
+            s.check(motor.device(), group)?;
             if s.finish_motor(motor, &generations) {
                 s.log(format!("{} → stop", motor.label()));
             }
@@ -281,15 +292,16 @@ impl LegoDevice for MockDevice {
                 .filter(|k| s.is_attached(*k))
                 .map(|kind| AttachedDevice {
                     kind,
+                    group: s.group(kind),
                     name: "simulated".into(),
                 })
                 .collect())
         })
     }
 
-    async fn motor_run(&self, motor: Motor, direction: Direction, speed: Speed) -> HwResult<()> {
+    async fn motor_run(&self, motor: Motor, group: CardGroup, direction: Direction, speed: Speed) -> HwResult<()> {
         self.with_state(|s| {
-            s.check(motor.device())?;
+            s.check(motor.device(), group)?;
             let signed = speed.signed(direction);
             let changed = s.motor_speeds(motor).iter().any(|v| *v != signed);
             s.set_motor(motor, signed);
@@ -303,6 +315,7 @@ impl LegoDevice for MockDevice {
     async fn motor_run_for_time(
         &self,
         motor: Motor,
+        group: CardGroup,
         direction: Direction,
         speed: Speed,
         duration: Duration,
@@ -313,18 +326,19 @@ impl LegoDevice for MockDevice {
             speed.signed(direction),
             duration.as_secs_f64()
         );
-        self.timed(motor, direction, speed, duration, text).await
+        self.timed(motor, group, direction, speed, duration, text).await
     }
 
     async fn motor_run_for_degrees(
         &self,
         motor: Motor,
+        group: CardGroup,
         direction: Direction,
         speed: Speed,
         degrees: u32,
     ) -> HwResult<()> {
         if speed.percent() == 0 || degrees == 0 {
-            return self.with_state(|s| s.check(motor.device()));
+            return self.with_state(|s| s.check(motor.device(), group));
         }
         let secs = degrees as f64 / (speed.percent() as f64 * DEG_PER_SEC_PER_PERCENT);
         let text = format!(
@@ -333,13 +347,13 @@ impl LegoDevice for MockDevice {
             speed.signed(direction),
             degrees
         );
-        self.timed(motor, direction, speed, Duration::from_secs_f64(secs), text)
+        self.timed(motor, group, direction, speed, Duration::from_secs_f64(secs), text)
             .await
     }
 
-    async fn motor_stop(&self, motor: Motor) -> HwResult<()> {
+    async fn motor_stop(&self, motor: Motor, group: CardGroup) -> HwResult<()> {
         self.with_state(|s| {
-            s.check(motor.device())?;
+            s.check(motor.device(), group)?;
             let changed = s.motor_speeds(motor).iter().any(|v| *v != 0);
             s.set_motor(motor, 0);
             if changed {
@@ -360,9 +374,9 @@ impl LegoDevice for MockDevice {
         })
     }
 
-    async fn motor_reset_position(&self, motor: Motor) -> HwResult<()> {
+    async fn motor_reset_position(&self, motor: Motor, group: CardGroup) -> HwResult<()> {
         self.with_state(|s| {
-            s.check(motor.device())?;
+            s.check(motor.device(), group)?;
             for m in s.motors_mut(motor) {
                 m.position = 0.0;
             }
@@ -383,36 +397,36 @@ impl LegoDevice for MockDevice {
         })
     }
 
-    async fn read_sensor(&self, query: SensorQuery) -> HwResult<SensorValue> {
+    async fn read_sensors(&self, query: SensorQuery, group: CardGroup) -> HwResult<Vec<SensorValue>> {
         self.with_state(|s| match query {
             SensorQuery::Color => {
-                s.check(DeviceKind::ColorSensor)?;
-                Ok(SensorValue::Color(s.color))
+                s.check(DeviceKind::ColorSensor, group)?;
+                Ok(vec![SensorValue::Color(s.color)])
             }
             SensorQuery::Reflection => {
-                s.check(DeviceKind::ColorSensor)?;
-                Ok(SensorValue::Percent(s.reflection as i32))
+                s.check(DeviceKind::ColorSensor, group)?;
+                Ok(vec![SensorValue::Percent(s.reflection as i32)])
             }
             SensorQuery::MotorPosition(motor) => {
-                s.check(motor.device())?;
+                s.check(motor.device(), group)?;
                 let pos = match motor {
                     Motor::Single => s.single.position,
                     Motor::DoubleLeft | Motor::DoubleBoth => s.left.position,
                     Motor::DoubleRight => s.right.position,
                 };
-                Ok(SensorValue::Degrees(pos.round() as i64))
+                Ok(vec![SensorValue::Degrees(pos.round() as i64)])
             }
             SensorQuery::ControllerLever(lever) => {
-                s.check(DeviceKind::Controller)?;
+                s.check(DeviceKind::Controller, group)?;
                 let v = match lever {
                     Lever::Left => s.lever_left,
                     Lever::Right => s.lever_right,
                 };
-                Ok(SensorValue::Percent(v as i32))
+                Ok(vec![SensorValue::Percent(v as i32)])
             }
             SensorQuery::Button(kind) => {
-                s.check(kind)?;
-                Ok(SensorValue::Pressed(s.button(kind)))
+                s.check(kind, group)?;
+                Ok(vec![SensorValue::Pressed(s.button(kind))])
             }
         })
     }
@@ -428,6 +442,7 @@ mod tests {
         dev.connect().await.unwrap();
         dev.motor_run_for_time(
             Motor::Single,
+            CardGroup::NoCard,
             Direction::Clockwise,
             Speed::new(50),
             Duration::from_secs(1),
@@ -441,7 +456,7 @@ mod tests {
     async fn commands_fail_when_disconnected() {
         let dev = MockDevice::new();
         let err = dev
-            .motor_run(Motor::Single, Direction::Clockwise, Speed::new(50))
+            .motor_run(Motor::Single, CardGroup::NoCard, Direction::Clockwise, Speed::new(50))
             .await
             .unwrap_err();
         assert_eq!(err, HardwareError::NotConnected);
@@ -452,7 +467,39 @@ mod tests {
         let dev = MockDevice::new();
         dev.connect().await.unwrap();
         dev.with_state(|s| s.set_attached(DeviceKind::DoubleMotor, false));
-        let err = dev.motor_stop(Motor::DoubleLeft).await.unwrap_err();
+        let err = dev.motor_stop(Motor::DoubleLeft, CardGroup::NoCard).await.unwrap_err();
         assert_eq!(err, HardwareError::DeviceMissing(DeviceKind::DoubleMotor));
+    }
+
+    #[tokio::test]
+    async fn motor_commands_require_the_selected_card_group() {
+        let dev = MockDevice::new();
+        dev.connect().await.unwrap();
+        dev.with_state(|s| s.set_group(DeviceKind::SingleMotor, CardGroup::Blue));
+
+        let missing = dev
+            .motor_run(Motor::Single, CardGroup::NoCard, Direction::Clockwise, Speed::new(40))
+            .await
+            .unwrap_err();
+        assert_eq!(missing, HardwareError::DeviceMissing(DeviceKind::SingleMotor));
+
+        dev.motor_run(Motor::Single, CardGroup::Blue, Direction::Clockwise, Speed::new(40))
+            .await
+            .unwrap();
+        assert_eq!(dev.with_state(|s| s.single.speed), 40);
+    }
+
+    #[tokio::test]
+    async fn sensor_readings_are_scoped_to_the_selected_card_group() {
+        let dev = MockDevice::new();
+        dev.connect().await.unwrap();
+        dev.with_state(|s| {
+            s.set_group(DeviceKind::ColorSensor, CardGroup::Blue);
+            s.color = LegoColor::Red;
+        });
+
+        let values = dev.read_sensors(SensorQuery::Color, CardGroup::Blue).await.unwrap();
+        assert_eq!(values, vec![SensorValue::Color(LegoColor::Red)]);
+        assert_eq!(dev.read_sensors(SensorQuery::Color, CardGroup::NoCard).await.unwrap_err(), HardwareError::DeviceMissing(DeviceKind::ColorSensor));
     }
 }

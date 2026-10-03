@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::hardware::{DeviceKind, LegoColor, Lever, Motor, SensorQuery, SensorValue};
+use crate::hardware::{CardGroup, DeviceKind, DeviceTarget, LegoColor, Lever, Motor, SensorQuery, SensorValue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Comparison {
@@ -33,15 +33,40 @@ impl Comparison {
 #[serde(tag = "sensor", rename_all = "snake_case")]
 pub enum Condition {
     /// Colour Sensor sees a colour.
-    ColorIs { color: LegoColor },
+    ColorIs {
+        color: LegoColor,
+        #[serde(default)]
+        group: CardGroup,
+    },
     /// Colour Sensor reflection in percent.
-    Reflection { cmp: Comparison, percent: i32 },
+    Reflection {
+        cmp: Comparison,
+        percent: i32,
+        #[serde(default)]
+        group: CardGroup,
+    },
     /// The button on a device is pressed.
-    ButtonPressed { device: DeviceKind },
+    ButtonPressed {
+        device: DeviceKind,
+        #[serde(default)]
+        group: CardGroup,
+    },
     /// Relative motor position in degrees.
-    MotorPosition { motor: Motor, cmp: Comparison, degrees: i32 },
+    MotorPosition {
+        motor: Motor,
+        cmp: Comparison,
+        degrees: i32,
+        #[serde(default)]
+        group: CardGroup,
+    },
     /// Controller lever position in percent (−100…100).
-    LeverPosition { lever: Lever, cmp: Comparison, percent: i32 },
+    LeverPosition {
+        lever: Lever,
+        cmp: Comparison,
+        percent: i32,
+        #[serde(default)]
+        group: CardGroup,
+    },
 }
 
 /// The kinds of condition, for the sensor picker.
@@ -75,18 +100,30 @@ impl ConditionKind {
 
     pub fn default_condition(self) -> Condition {
         match self {
-            ConditionKind::Color => Condition::ColorIs { color: LegoColor::Red },
-            ConditionKind::Reflection => Condition::Reflection { cmp: Comparison::Greater, percent: 50 },
-            ConditionKind::Button => Condition::ButtonPressed { device: DeviceKind::Controller },
+            ConditionKind::Color => Condition::ColorIs {
+                color: LegoColor::Red,
+                group: CardGroup::NoCard,
+            },
+            ConditionKind::Reflection => Condition::Reflection {
+                cmp: Comparison::Greater,
+                percent: 50,
+                group: CardGroup::NoCard,
+            },
+            ConditionKind::Button => Condition::ButtonPressed {
+                device: DeviceKind::Controller,
+                group: CardGroup::NoCard,
+            },
             ConditionKind::MotorPosition => Condition::MotorPosition {
                 motor: Motor::Single,
                 cmp: Comparison::Greater,
                 degrees: 90,
+                group: CardGroup::NoCard,
             },
             ConditionKind::Lever => Condition::LeverPosition {
                 lever: Lever::Left,
                 cmp: Comparison::Greater,
                 percent: 50,
+                group: CardGroup::NoCard,
             },
         }
     }
@@ -115,17 +152,28 @@ impl Condition {
     pub fn device(&self) -> DeviceKind {
         match self {
             Condition::ColorIs { .. } | Condition::Reflection { .. } => DeviceKind::ColorSensor,
-            Condition::ButtonPressed { device } => *device,
+            Condition::ButtonPressed { device, .. } => *device,
             Condition::MotorPosition { motor, .. } => motor.device(),
             Condition::LeverPosition { .. } => DeviceKind::Controller,
         }
+    }
+
+    pub fn target(&self) -> DeviceTarget {
+        let group = match *self {
+            Condition::ColorIs { group, .. }
+            | Condition::Reflection { group, .. }
+            | Condition::ButtonPressed { group, .. }
+            | Condition::MotorPosition { group, .. }
+            | Condition::LeverPosition { group, .. } => group,
+        };
+        DeviceTarget { kind: self.device(), group }
     }
 
     pub fn query(&self) -> SensorQuery {
         match *self {
             Condition::ColorIs { .. } => SensorQuery::Color,
             Condition::Reflection { .. } => SensorQuery::Reflection,
-            Condition::ButtonPressed { device } => SensorQuery::Button(device),
+            Condition::ButtonPressed { device, .. } => SensorQuery::Button(device),
             Condition::MotorPosition { motor, .. } => SensorQuery::MotorPosition(motor),
             Condition::LeverPosition { lever, .. } => SensorQuery::ControllerLever(lever),
         }
@@ -134,8 +182,8 @@ impl Condition {
     /// Evaluate against a sensor reading. A reading of the wrong type is false.
     pub fn evaluate(&self, value: SensorValue) -> bool {
         match (*self, value) {
-            (Condition::ColorIs { color }, SensorValue::Color(seen)) => color == seen,
-            (Condition::Reflection { cmp, percent }, SensorValue::Percent(v))
+            (Condition::ColorIs { color, .. }, SensorValue::Color(seen)) => color == seen,
+            (Condition::Reflection { cmp, percent, .. }, SensorValue::Percent(v))
             | (Condition::LeverPosition { cmp, percent, .. }, SensorValue::Percent(v)) => {
                 cmp.test(v as i64, percent as i64)
             }
@@ -145,6 +193,12 @@ impl Condition {
             }
             _ => false,
         }
+    }
+
+    /// A card-colour group may contain several matching devices. Conditions
+    /// succeed when any device's latest reading satisfies them.
+    pub fn evaluate_any(&self, values: impl IntoIterator<Item = SensorValue>) -> bool {
+        values.into_iter().any(|value| self.evaluate(value))
     }
 
     pub fn sanitize(&mut self) {
@@ -165,13 +219,13 @@ impl Condition {
     /// Short text, e.g. for palette chips and ghosts.
     pub fn describe(&self) -> String {
         match self {
-            Condition::ColorIs { color } => format!("colour is {}", color.label()),
-            Condition::Reflection { cmp, percent } => format!("reflection {} {percent}%", cmp.symbol()),
-            Condition::ButtonPressed { device } => format!("{} button pressed", device.label()),
-            Condition::MotorPosition { motor, cmp, degrees } => {
+            Condition::ColorIs { color, .. } => format!("colour is {}", color.label()),
+            Condition::Reflection { cmp, percent, .. } => format!("reflection {} {percent}%", cmp.symbol()),
+            Condition::ButtonPressed { device, .. } => format!("{} button pressed", device.label()),
+            Condition::MotorPosition { motor, cmp, degrees, .. } => {
                 format!("{} position {} {degrees}°", motor.label(), cmp.symbol())
             }
-            Condition::LeverPosition { lever, cmp, percent } => {
+            Condition::LeverPosition { lever, cmp, percent, .. } => {
                 format!("{} lever {} {percent}%", lever.label(), cmp.symbol())
             }
         }
@@ -184,20 +238,51 @@ mod tests {
 
     #[test]
     fn evaluates_readings() {
-        let red = Condition::ColorIs { color: LegoColor::Red };
+        let red = Condition::ColorIs { color: LegoColor::Red, group: CardGroup::NoCard };
         assert!(red.evaluate(SensorValue::Color(LegoColor::Red)));
         assert!(!red.evaluate(SensorValue::Color(LegoColor::Blue)));
         assert!(!red.evaluate(SensorValue::Percent(5)), "wrong reading type is false");
 
-        let pos = Condition::MotorPosition { motor: Motor::Single, cmp: Comparison::Greater, degrees: 90 };
+        let pos = Condition::MotorPosition {
+            motor: Motor::Single,
+            cmp: Comparison::Greater,
+            degrees: 90,
+            group: CardGroup::NoCard,
+        };
         assert!(pos.evaluate(SensorValue::Degrees(91)));
         assert!(!pos.evaluate(SensorValue::Degrees(90)));
     }
 
     #[test]
+    fn group_condition_matches_any_device_reading() {
+        let red = Condition::ColorIs { color: LegoColor::Red, group: CardGroup::Blue };
+        assert!(red.evaluate_any([
+            SensorValue::Color(LegoColor::Blue),
+            SensorValue::Color(LegoColor::Red)
+        ]));
+        assert!(!red.evaluate_any([
+            SensorValue::Color(LegoColor::Blue),
+            SensorValue::Color(LegoColor::Yellow)
+        ]));
+    }
+
+    #[test]
     fn sanitize_clamps() {
-        let mut c = Condition::LeverPosition { lever: Lever::Left, cmp: Comparison::Less, percent: 999 };
+        let mut c = Condition::LeverPosition {
+            lever: Lever::Left,
+            cmp: Comparison::Less,
+            percent: 999,
+            group: CardGroup::NoCard,
+        };
         c.sanitize();
-        assert_eq!(c, Condition::LeverPosition { lever: Lever::Left, cmp: Comparison::Less, percent: 100 });
+        assert_eq!(
+            c,
+            Condition::LeverPosition {
+                lever: Lever::Left,
+                cmp: Comparison::Less,
+                percent: 100,
+                group: CardGroup::NoCard,
+            }
+        );
     }
 }

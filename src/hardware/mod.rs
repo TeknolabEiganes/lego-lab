@@ -2,12 +2,12 @@
 //!
 //! Everything above this module (executor, UI) talks to LEGO hardware only
 //! through the [`LegoDevice`] trait. Protocol details live in the concrete
-//! backends: [`mock`] (simulator) and [`lego`] (real BLE hardware, unfinished).
+//! backends: [`mock`] (simulator) and [`lego`] (real BLE hardware).
 //!
 //! The LEGO Education Computer Science & AI kits have no hub with ports.
 //! Every element (Single Motor, Double Motor, Colour Sensor, Controller) is a
-//! separate Bluetooth LE device. A [`Motor`] therefore names a motor on a
-//! specific device rather than a hub port.
+//! separate Bluetooth LE device. A [`Motor`] names the motor layout; commands
+//! combine it with a [`CardGroup`] to target one device group rather than a hub port.
 
 pub mod lego;
 pub mod mock;
@@ -126,6 +126,82 @@ pub enum DeviceKind {
     Controller,
 }
 
+/// Connection-card colour used to group physical devices. This is deliberately
+/// separate from [`LegoColor`], which represents colours seen by a Colour Sensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+pub enum CardGroup {
+    #[default]
+    NoCard,
+    Pink,
+    Purple,
+    Blue,
+    Azure,
+    Turquoise,
+    Green,
+    Yellow,
+    Orange,
+    Red,
+    White,
+}
+
+impl CardGroup {
+    pub const ALL: [CardGroup; 11] = [
+        CardGroup::NoCard,
+        CardGroup::Pink,
+        CardGroup::Purple,
+        CardGroup::Blue,
+        CardGroup::Azure,
+        CardGroup::Turquoise,
+        CardGroup::Green,
+        CardGroup::Yellow,
+        CardGroup::Orange,
+        CardGroup::Red,
+        CardGroup::White,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CardGroup::NoCard => "No card",
+            CardGroup::Pink => "Pink card",
+            CardGroup::Purple => "Purple card",
+            CardGroup::Blue => "Blue card",
+            CardGroup::Azure => "Azure card",
+            CardGroup::Turquoise => "Turquoise card",
+            CardGroup::Green => "Green card",
+            CardGroup::Yellow => "Yellow card",
+            CardGroup::Orange => "Orange card",
+            CardGroup::Red => "Red card",
+            CardGroup::White => "White card",
+        }
+    }
+
+    /// LEGO firmware connection-card colour number. Unknown and zero values
+    /// are treated as unassigned cards.
+    pub fn from_firmware(color: i8) -> Self {
+        match color {
+            1 => CardGroup::Pink,
+            2 => CardGroup::Purple,
+            3 => CardGroup::Blue,
+            4 => CardGroup::Azure,
+            5 => CardGroup::Turquoise,
+            6 => CardGroup::Green,
+            7 => CardGroup::Yellow,
+            8 => CardGroup::Orange,
+            9 => CardGroup::Red,
+            10 => CardGroup::White,
+            _ => CardGroup::NoCard,
+        }
+    }
+}
+
+/// A device kind within a connection-card colour group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DeviceTarget {
+    pub kind: DeviceKind,
+    #[serde(default)]
+    pub group: CardGroup,
+}
+
 impl DeviceKind {
     pub const ALL: [DeviceKind; 4] = [
         DeviceKind::SingleMotor,
@@ -148,6 +224,7 @@ impl DeviceKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachedDevice {
     pub kind: DeviceKind,
+    pub group: CardGroup,
     /// Human readable identification, e.g. a connection card or "simulated".
     pub name: String,
 }
@@ -275,12 +352,13 @@ pub trait LegoDevice: Send + Sync {
     async fn discover(&self) -> HwResult<Vec<AttachedDevice>>;
 
     /// Start a motor running continuously.
-    async fn motor_run(&self, motor: Motor, direction: Direction, speed: Speed) -> HwResult<()>;
+    async fn motor_run(&self, motor: Motor, group: CardGroup, direction: Direction, speed: Speed) -> HwResult<()>;
 
     /// Run a motor for a duration, resolving when it has finished.
     async fn motor_run_for_time(
         &self,
         motor: Motor,
+        group: CardGroup,
         direction: Direction,
         speed: Speed,
         duration: Duration,
@@ -290,15 +368,16 @@ pub trait LegoDevice: Send + Sync {
     async fn motor_run_for_degrees(
         &self,
         motor: Motor,
+        group: CardGroup,
         direction: Direction,
         speed: Speed,
         degrees: u32,
     ) -> HwResult<()>;
 
-    async fn motor_stop(&self, motor: Motor) -> HwResult<()>;
+    async fn motor_stop(&self, motor: Motor, group: CardGroup) -> HwResult<()>;
 
     /// Set a motor's position count back to 0°.
-    async fn motor_reset_position(&self, motor: Motor) -> HwResult<()>;
+    async fn motor_reset_position(&self, motor: Motor, group: CardGroup) -> HwResult<()>;
 
     /// Set every connected motor's position count back to 0° (done when a
     /// program starts, so "motor position" means "turned since RUN").
@@ -307,7 +386,8 @@ pub trait LegoDevice: Send + Sync {
     /// Stop every motor on every device. Must be safe to call at any time.
     async fn stop_all(&self) -> HwResult<()>;
 
-    async fn read_sensor(&self, query: SensorQuery) -> HwResult<SensorValue>;
+    /// Read the latest value from every matching device in this card group.
+    async fn read_sensors(&self, query: SensorQuery, group: CardGroup) -> HwResult<Vec<SensorValue>>;
 
     /// Live per-device readings for the device panel (real hardware).
     fn snapshot(&self) -> Vec<DeviceSnapshot> {
@@ -319,6 +399,7 @@ pub trait LegoDevice: Send + Sync {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceSnapshot {
     pub kind: DeviceKind,
+    pub group: CardGroup,
     /// Bluetooth address (matches `FoundDevice::address`).
     pub address: String,
     /// e.g. "blue 3683" (connection card).
@@ -344,5 +425,14 @@ mod tests {
         assert_eq!(Speed::new(250).percent(), 100);
         assert_eq!(Speed::new(42).percent(), 42);
         assert_eq!(Speed::new(30).signed(Direction::CounterClockwise), -30);
+    }
+
+    #[test]
+    fn card_groups_use_connection_card_colours_not_sensor_colours() {
+        assert_eq!(CardGroup::from_firmware(0), CardGroup::NoCard);
+        assert_eq!(CardGroup::from_firmware(1), CardGroup::Pink);
+        assert_eq!(CardGroup::from_firmware(3), CardGroup::Blue);
+        assert_eq!(CardGroup::from_firmware(9), CardGroup::Red);
+        assert_eq!(CardGroup::from_firmware(99), CardGroup::NoCard);
     }
 }

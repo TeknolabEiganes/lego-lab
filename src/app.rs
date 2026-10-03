@@ -12,13 +12,13 @@ use tokio_util::sync::CancellationToken;
 use crate::executor::{ExecEvent, Executor, RunOutcome};
 use crate::hardware::lego::LegoBleDevice;
 use crate::hardware::mock::MockDevice;
-use crate::hardware::{AttachedDevice, ConnectionState, HwResult, LegoDevice};
+use crate::hardware::{AttachedDevice, CardGroup, ConnectionState, HwResult, LegoDevice};
 use crate::program::compiler;
 use crate::project::{self, Project};
 use crate::ui::canvas::{self, CanvasInfo, Editor};
 use crate::ui::device_panel::{self, HardwareView, PanelAction, StatusLine};
 use crate::ui::toolbar::{self, Backend, ToolbarAction, ToolbarState};
-use crate::ui::{palette, theme};
+use crate::ui::{icons::IconTextures, palette, theme};
 use crate::visual::{BlockId, Workspace};
 
 const HIGHLIGHT_LINGER: Duration = Duration::from_millis(180);
@@ -41,6 +41,7 @@ pub struct LegoLabApp {
     ble: LegoBleDevice,
     device: Arc<dyn LegoDevice>,
     backend: Backend,
+    icons: IconTextures,
 
     editor: Editor,
     project_name: String,
@@ -58,12 +59,15 @@ pub struct LegoLabApp {
     last_discover: Instant,
     hw_tx: UnboundedSender<HwMsg>,
     hw_rx: UnboundedReceiver<HwMsg>,
-    show_simulator: bool,
+    show_blocks: bool,
+    show_right_panel: bool,
+    device_filter: Option<CardGroup>,
 }
 
 impl LegoLabApp {
     pub fn new(cc: &eframe::CreationContext<'_>, open_path: Option<PathBuf>, bluetooth: bool) -> Self {
         theme::apply(&cc.egui_ctx);
+        let icons = IconTextures::load(&cc.egui_ctx);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -78,6 +82,7 @@ impl LegoLabApp {
             mock,
             ble: LegoBleDevice::new(),
             backend: Backend::Simulator,
+            icons,
             editor: Editor::new(Workspace::example()),
             project_name: "My Robot".into(),
             path: None,
@@ -91,7 +96,9 @@ impl LegoLabApp {
             last_discover: Instant::now(),
             hw_tx,
             hw_rx,
-            show_simulator: true,
+            show_blocks: true,
+            show_right_panel: true,
+            device_filter: None,
         };
         if let Some(path) = open_path {
             app.open_path(path);
@@ -155,7 +162,7 @@ impl LegoLabApp {
             Backend::Simulator => Arc::new(self.mock.clone()),
             Backend::Bluetooth => Arc::new(self.ble.clone()),
         };
-        self.show_simulator = true;
+        self.show_right_panel = true;
         match backend {
             // The simulator is always there: connect straight away.
             Backend::Simulator => self.connect(ctx),
@@ -191,6 +198,14 @@ impl LegoLabApp {
         let ble = self.ble.clone();
         match action {
             PanelAction::Scan => self.scan(ctx),
+            PanelAction::SetDeviceFilter(filter) => self.device_filter = filter,
+            PanelAction::ConnectMatching(filter) => {
+                self.info(if filter.is_some() { "Connecting to matching devices…" } else { "Connecting to all found devices…" });
+                self.spawn_hw(ctx, async move {
+                    let connected = ble.connect_matching_found(filter).await;
+                    vec![HwMsg::Connected(connected), HwMsg::Discovered(ble.discover().await)]
+                });
+            }
             PanelAction::Connect(address) => {
                 self.info("Connecting…");
                 self.spawn_hw(ctx, async move {
@@ -251,9 +266,10 @@ impl LegoLabApp {
                 HwMsg::Scanned(Ok(0)) => self.error(
                     "No LEGO devices found. Switch them on and check their light is blinking, then Scan again.",
                 ),
-                HwMsg::Scanned(Ok(n)) => {
-                    self.info(format!("Found {n} LEGO device{}. Pick one and press Connect.", if n == 1 { "" } else { "s" }))
-                }
+                HwMsg::Scanned(Ok(n)) => self.info(format!(
+                    "Found {n} device{}. Connect individually or choose Connect all.",
+                    if n == 1 { "" } else { "s" }
+                )),
                 HwMsg::Scanned(Err(e)) => self.error(format!("Could not scan: {e}")),
             }
         }
@@ -283,9 +299,18 @@ impl LegoLabApp {
         if let Some(missing) = compiled
             .devices
             .iter()
-            .find(|k| !self.devices.iter().any(|d| d.kind == **k))
+            .find(|target| {
+                !self
+                    .devices
+                    .iter()
+                    .any(|d| d.kind == target.kind && d.group == target.group)
+            })
         {
-            self.error(format!("Your program uses the {}, but it isn't connected.", missing.label()));
+            self.error(format!(
+                "Your program uses the {} ({}) group, but it isn't connected.",
+                missing.kind.label(),
+                missing.group.label()
+            ));
             return;
         }
 
@@ -430,6 +455,9 @@ impl LegoLabApp {
         let save = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
         let open = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
         let new = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
+        let toggle_blocks = KeyboardShortcut::new(Modifiers::COMMAND, Key::Num1);
+        let toggle_right_panel = KeyboardShortcut::new(Modifiers::COMMAND, Key::Num2);
+        let toggle_panes = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
         let run = KeyboardShortcut::new(Modifiers::NONE, Key::F5);
         ctx.input_mut(|i| {
             if i.consume_shortcut(&save_as) {
@@ -443,6 +471,15 @@ impl LegoLabApp {
             }
             if i.consume_shortcut(&new) {
                 out.push(ToolbarAction::New);
+            }
+            if i.consume_shortcut(&toggle_blocks) {
+                out.push(ToolbarAction::ToggleBlocks);
+            }
+            if i.consume_shortcut(&toggle_right_panel) {
+                out.push(ToolbarAction::TogglePanel);
+            }
+            if i.consume_shortcut(&toggle_panes) {
+                out.push(ToolbarAction::TogglePanes);
             }
             if i.consume_shortcut(&run) {
                 out.push(ToolbarAction::Run);
@@ -465,7 +502,15 @@ impl LegoLabApp {
             ToolbarAction::SelectBackend(b) => self.select_backend(b, ctx),
             ToolbarAction::Run => self.run_program(ctx),
             ToolbarAction::Stop => self.stop(),
-            ToolbarAction::ToggleSimulator => self.show_simulator = !self.show_simulator,
+            ToolbarAction::ToggleBlocks => self.show_blocks = !self.show_blocks,
+            ToolbarAction::TogglePanel => self.show_right_panel = !self.show_right_panel,
+            ToolbarAction::TogglePanes => {
+                // Treat Ctrl/Cmd+F as one combined toggle: if either pane is
+                // open, hide both; if both are hidden, show both.
+                let show = !(self.show_blocks || self.show_right_panel);
+                self.show_blocks = show;
+                self.show_right_panel = show;
+            }
         }
     }
 }
@@ -496,7 +541,6 @@ impl eframe::App for LegoLabApp {
                         connection,
                         backend: self.backend,
                         running,
-                        show_simulator: self.show_simulator,
                     },
                 ));
                 if self.project_name != name_before {
@@ -508,24 +552,32 @@ impl eframe::App for LegoLabApp {
             .exact_size(34.0)
             .frame(bar(theme::PANEL))
             .show(ui, |ui| {
-                device_panel::status_bar(
+                actions.extend(device_panel::status_bar(
                     ui,
                     self.device.backend_name(),
                     connection,
                     &self.devices,
                     self.status.as_ref(),
-                );
+                    self.backend,
+                    self.show_blocks,
+                    self.show_right_panel,
+                    &self.icons,
+                ));
             });
 
-        let palette_resp = egui::Panel::left("palette")
-            .exact_size(210.0)
-            .resizable(false)
-            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(10))
-            .show(ui, |ui| palette::show(ui, &mut self.editor));
-        self.editor.palette_rect = palette_resp.response.rect;
+        if self.show_blocks {
+            let palette_resp = egui::Panel::left("palette")
+                .exact_size(210.0)
+                .resizable(false)
+                .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(10))
+                .show(ui, |ui| palette::show(ui, &mut self.editor, &self.icons));
+            self.editor.palette_rect = palette_resp.response.rect;
+        } else {
+            self.editor.palette_rect = egui::Rect::NOTHING;
+        }
 
         let mut panel_actions = Vec::new();
-        if self.show_simulator {
+        if self.show_right_panel {
             egui::Panel::right("simulator")
                 .default_size(300.0)
                 .size_range(260.0..=420.0)
@@ -539,8 +591,9 @@ impl eframe::App for LegoLabApp {
                             found: &self.ble.last_scan(),
                             connected: &self.ble.connected_addresses(),
                             live: &self.device.snapshot(),
+                            filter: self.device_filter,
                         };
-                        if let Some(action) = device_panel::hardware_panel(ui, view) {
+                        if let Some(action) = device_panel::hardware_panel(ui, view, &self.icons) {
                             panel_actions.push(action);
                         }
                     }

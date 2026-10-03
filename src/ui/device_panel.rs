@@ -2,11 +2,13 @@
 
 use egui::{Color32, RichText, Sense, Stroke, Ui, vec2};
 
-use crate::hardware::mock::{MockDevice, MockMotor, MockState};
 use crate::hardware::lego::FoundDevice;
-use crate::hardware::{AttachedDevice, ConnectionState, DeviceKind, DeviceSnapshot, LegoColor};
+use crate::hardware::mock::{MockDevice, MockMotor, MockState};
+use crate::hardware::{AttachedDevice, CardGroup, ConnectionState, DeviceKind, DeviceSnapshot, LegoColor};
 
+use super::icons::{self, IconTextures};
 use super::theme;
+use super::toolbar::{Backend, ToolbarAction};
 
 pub struct StatusLine {
     pub text: String,
@@ -19,9 +21,24 @@ pub fn status_bar(
     connection: ConnectionState,
     devices: &[AttachedDevice],
     status: Option<&StatusLine>,
-) {
+    mode: Backend,
+    show_blocks: bool,
+    show_right_panel: bool,
+    icons: &IconTextures,
+) -> Vec<ToolbarAction> {
+    let mut actions = Vec::new();
     ui.horizontal_centered(|ui| {
         ui.add_space(6.0);
+        let blocks = ui.add_sized(
+            vec2(28.0, 24.0),
+            egui::Button::new("").fill(Color32::TRANSPARENT).stroke(Stroke::NONE),
+        );
+        let blocks_color = if show_blocks { theme::TEXT } else { theme::TEXT_MUTED };
+        icons.puzzle(ui.painter(), egui::Rect::from_center_size(blocks.rect.center(), vec2(16.0, 16.0)), blocks_color);
+        if blocks.on_hover_text("Blocks pane (Ctrl/Cmd+1; Ctrl/Cmd+F toggles both)").clicked() {
+            actions.push(ToolbarAction::ToggleBlocks);
+        }
+        ui.add_space(8.0);
         let dot = match connection {
             ConnectionState::Connected => theme::OK_GREEN,
             ConnectionState::Connecting => theme::WARN_AMBER,
@@ -52,14 +69,32 @@ pub fn status_bar(
                 ui.add_space(10.0);
             }
         }
-        if let Some(status) = status {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let panel_button = ui.add_sized(
+                vec2(28.0, 24.0),
+                egui::Button::new("").fill(Color32::TRANSPARENT).stroke(Stroke::NONE),
+            );
+            let panel_color = if show_right_panel { theme::TEXT } else { theme::TEXT_MUTED };
+            if mode == Backend::Simulator {
+                icons::gamepad(ui.painter(), egui::Rect::from_center_size(panel_button.rect.center(), vec2(16.0, 16.0)), panel_color);
+            } else {
+                icons.lego(ui.painter(), egui::Rect::from_center_size(panel_button.rect.center(), vec2(16.0, 16.0)), panel_color);
+            }
+            let panel_name = if mode == Backend::Simulator { "Simulator" } else { "Devices" };
+            if panel_button
+                .on_hover_text(format!("{panel_name} pane (Ctrl/Cmd+2; Ctrl/Cmd+F toggles both)"))
+                .clicked()
+            {
+                actions.push(ToolbarAction::TogglePanel);
+            }
+            if let Some(status) = status {
                 ui.add_space(8.0);
                 ui.add(egui::Label::new(RichText::new(&status.text).color(status.color)).truncate())
                     .on_hover_text(&status.text);
-            });
-        }
+            }
+        });
     });
+    actions
 }
 
 fn card(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
@@ -90,6 +125,22 @@ fn device_header(ui: &mut Ui, s: &mut MockState, kind: DeviceKind) -> bool {
             s.set_button(kind, pressed && on);
         });
     });
+    ui.horizontal(|ui| {
+        ui.label("Card group");
+        let mut group = s.group(kind);
+        egui::ComboBox::from_id_salt(("sim_card_group", kind))
+            .selected_text(group.label())
+            .width(125.0)
+            .show_ui(ui, |ui| {
+                for option in CardGroup::ALL {
+                    ui.selectable_value(&mut group, option, option.label());
+                }
+            });
+        if group != s.group(kind) {
+            s.set_group(kind, group);
+            s.log(format!("{} assigned to {}", kind.label(), group.label()));
+        }
+    });
     on
 }
 
@@ -113,7 +164,11 @@ fn motor_row(ui: &mut Ui, name: &str, m: &MockMotor) {
 
 pub fn simulator_panel(ui: &mut Ui, mock: &MockDevice) {
     ui.add_space(6.0);
-    ui.label(RichText::new("LEGO SIMULATOR").size(16.0).strong());
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+        icons::gamepad(ui.painter(), rect.shrink(2.0), theme::TEXT);
+        ui.label(RichText::new("SIMULATOR").size(16.0).strong());
+    });
     ui.add_space(4.0);
     mock.with_state(|s| {
         ui.horizontal(|ui| {
@@ -180,7 +235,7 @@ pub fn simulator_panel(ui: &mut Ui, mock: &MockDevice) {
                         ui.label(
                             RichText::new(format!("{}  {}", e.time, e.text))
                                 .monospace()
-                                .size(12.0),
+                                .size(12.0)
                         );
                     }
                 });
@@ -194,6 +249,8 @@ pub fn simulator_panel(ui: &mut Ui, mock: &MockDevice) {
 /// What the user asked for in the devices panel.
 pub enum PanelAction {
     Scan,
+    SetDeviceFilter(Option<CardGroup>),
+    ConnectMatching(Option<CardGroup>),
     Connect(String),
     Disconnect(String),
 }
@@ -205,6 +262,7 @@ pub struct HardwareView<'a> {
     pub found: &'a [FoundDevice],
     pub connected: &'a [String],
     pub live: &'a [DeviceSnapshot],
+    pub filter: Option<CardGroup>,
 }
 
 fn signal(rssi: Option<i16>) -> Option<(&'static str, &'static str)> {
@@ -226,33 +284,74 @@ fn readings_grid(ui: &mut Ui, d: &DeviceSnapshot) {
 }
 
 /// Scan, pick devices and see live readings from real hardware.
-pub fn hardware_panel(ui: &mut Ui, view: HardwareView) -> Option<PanelAction> {
+pub fn hardware_panel(ui: &mut Ui, view: HardwareView, icons: &IconTextures) -> Option<PanelAction> {
     let mut action = None;
+    let found_group = |d: &FoundDevice| {
+        view.live
+            .iter()
+            .find(|live| live.address == d.address)
+            .map_or(d.group, |live| live.group)
+    };
+    let has_matching_found = view.found.iter().any(|d| view.filter.is_none_or(|g| found_group(d) == g));
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        ui.label(RichText::new("LEGO DEVICES").size(16.0).strong());
+        let (rect, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+        icons.lego(ui.painter(), rect.shrink(2.0), theme::TEXT);
+        ui.label(RichText::new("DEVICES").size(16.0).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let scan = egui::Button::new(RichText::new("🔍 Scan").strong());
-            if ui.add_enabled(!view.busy, scan).on_hover_text("Look for LEGO devices nearby (4 seconds)").clicked() {
+            if ui.add_enabled(!view.busy, scan).on_hover_text("Look for devices nearby (4 seconds)").clicked() {
                 action = Some(PanelAction::Scan);
+            }
+            let connect_text = if view.filter.is_some() { "Connect filtered" } else { "Connect all" };
+            let connect = egui::Button::new(RichText::new(connect_text).strong());
+            if ui
+                .add_enabled(!view.busy && has_matching_found, connect)
+                .on_hover_text(if view.filter.is_some() {
+                    "Connect devices matching the selected card colour"
+                } else {
+                    "Connect every device found in the latest scan"
+                })
+                .clicked()
+            {
+                action = Some(PanelAction::ConnectMatching(view.filter));
             }
             if view.busy {
                 ui.spinner();
             }
         });
     });
+    let mut filter = view.filter;
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+        egui::ComboBox::from_id_salt("device_card_filter")
+            .selected_text(filter.map_or_else(|| "All colours".to_string(), |g| g.label().to_string()))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut filter, None, "All colours");
+                for group in CardGroup::ALL {
+                    ui.selectable_value(&mut filter, Some(group), group.label());
+                }
+            });
+    });
+    if filter != view.filter {
+        action = Some(PanelAction::SetDeviceFilter(filter));
+    }
     ui.add_space(6.0);
 
     egui::ScrollArea::vertical().id_salt("hw_scroll").show(ui, |ui| {
         if view.found.is_empty() && view.live.is_empty() && !view.busy {
             ui.label(
                 RichText::new(
-                    "Switch on your LEGO devices (their light blinks when they are ready), then press Scan.",
+                    "Switch on your devices (their light blinks when they are ready), then press Scan."
                 )
-                .color(theme::TEXT_MUTED),
+                .color(theme::TEXT_MUTED)
             );
         }
-        for d in view.found {
+        if !view.found.is_empty() && !has_matching_found {
+            if let Some(group) = view.filter {
+                ui.label(RichText::new(format!("No devices match the {} filter.", group.label())).color(theme::TEXT_MUTED));
+            }
+        }
+        for d in view.found.iter().filter(|d| view.filter.is_none_or(|g| found_group(d) == g)) {
             let connected = view.connected.contains(&d.address);
             let live = view.live.iter().find(|l| l.address == d.address);
             // A card scanned while connected is newer than the scan result.
@@ -293,7 +392,9 @@ pub fn hardware_panel(ui: &mut Ui, view: HardwareView) -> Option<PanelAction> {
             });
         }
         // Connected devices that aren't in the scan list (e.g. after a re-scan).
-        for live in view.live.iter().filter(|l| !view.found.iter().any(|f| f.address == l.address)) {
+        for live in view.live.iter().filter(|l| {
+            view.filter.is_none_or(|g| l.group == g) && !view.found.iter().any(|f| f.address == l.address)
+        }) {
             card(ui, |ui| {
                 ui.label(RichText::new(live.kind.label()).size(15.0).strong());
                 ui.label(RichText::new(format!("Card {} · ✔ connected", live.card)).color(theme::TEXT_MUTED));

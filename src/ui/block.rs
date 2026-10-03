@@ -1,11 +1,11 @@
 //! Drawing and editing a single block.
 
 use egui::{
-    Align2, Color32, CornerRadius, DragValue, FontId, Painter, Rect, Stroke, StrokeKind, Ui, vec2,
+    Align2, Color32, CornerRadius, DragValue, FontId, Painter, Rect, Sense, Stroke, StrokeKind, Ui, vec2,
     pos2,
 };
 
-use crate::hardware::{DeviceKind, Direction, LegoColor, Lever, Motor};
+use crate::hardware::{CardGroup, DeviceKind, Direction, LegoColor, Lever, Motor};
 use crate::program::condition::{Comparison, Condition, ConditionKind, MAX_DEGREES};
 use crate::visual::{Block, BlockKind, Category, MAX_REPEAT, MAX_ROTATIONS, MAX_SECONDS};
 
@@ -161,12 +161,108 @@ pub fn condition_rect(kind: &BlockKind, header: Rect) -> Option<Rect> {
 fn motor_of(kind: &mut BlockKind) -> Option<&mut Motor> {
     match kind {
         BlockKind::RunMotor { motor, .. }
-        | BlockKind::StopMotor { motor }
-        | BlockKind::ResetPosition { motor }
+        | BlockKind::StopMotor { motor, .. }
+        | BlockKind::ResetPosition { motor, .. }
         | BlockKind::MotorForTime { motor, .. }
         | BlockKind::MotorRotations { motor, .. } => Some(motor),
         _ => None,
     }
+}
+
+fn condition_group_mut(c: &mut Condition) -> &mut CardGroup {
+    match c {
+        Condition::ColorIs { group, .. }
+        | Condition::Reflection { group, .. }
+        | Condition::ButtonPressed { group, .. }
+        | Condition::MotorPosition { group, .. }
+        | Condition::LeverPosition { group, .. } => group,
+    }
+}
+
+fn card_group_mut(kind: &mut BlockKind) -> Option<&mut CardGroup> {
+    match kind {
+        BlockKind::RunMotor { group, .. }
+        | BlockKind::StopMotor { group, .. }
+        | BlockKind::ResetPosition { group, .. }
+        | BlockKind::MotorForTime { group, .. }
+        | BlockKind::MotorRotations { group, .. } => Some(group),
+        BlockKind::WaitUntil { condition } | BlockKind::If { condition } | BlockKind::IfElse { condition } => {
+            Some(condition_group_mut(condition))
+        }
+        _ => None,
+    }
+}
+
+fn card_group(kind: &BlockKind) -> Option<CardGroup> {
+    if let Some(condition) = kind.condition() {
+        Some(condition.target().group)
+    } else {
+        match kind {
+            BlockKind::RunMotor { group, .. }
+            | BlockKind::StopMotor { group, .. }
+            | BlockKind::ResetPosition { group, .. }
+            | BlockKind::MotorForTime { group, .. }
+            | BlockKind::MotorRotations { group, .. } => Some(*group),
+            _ => None,
+        }
+    }
+}
+
+fn card_group_rgb(group: CardGroup) -> Option<[u8; 3]> {
+    match group {
+        CardGroup::NoCard => None,
+        CardGroup::Pink => Some([0xff, 0x69, 0xb4]),
+        CardGroup::Purple => Some([0x74, 0x46, 0x99]),
+        CardGroup::Blue => Some([0x00, 0x6c, 0xb8]),
+        CardGroup::Azure => Some([0x32, 0xb4, 0xf5]),
+        CardGroup::Turquoise => Some([0x00, 0xa3, 0xa3]),
+        CardGroup::Green => Some([0x61, 0xa8, 0x36]),
+        CardGroup::Yellow => Some([0xff, 0xd4, 0x00]),
+        CardGroup::Orange => Some([0xff, 0x88, 0x00]),
+        CardGroup::Red => Some([0xde, 0x1a, 0x21]),
+        CardGroup::White => Some([0xf4, 0xf4, 0xf4]),
+    }
+}
+
+fn paint_card_group_dot(painter: &Painter, rect: Rect, group: CardGroup, hovered: bool) {
+    let center = rect.center();
+    let radius = rect.width().min(rect.height()) * 0.38;
+    let stroke = if hovered { theme::HIGHLIGHT } else { Color32::WHITE };
+    if let Some([r, g, b]) = card_group_rgb(group) {
+        painter.circle_filled(center, radius, Color32::from_rgb(r, g, b));
+        let border = if group == CardGroup::White { theme::TEXT } else { stroke };
+        painter.circle_stroke(center, radius, Stroke::new(1.5, border));
+    } else {
+        // An unassigned device is an empty white circle, not a wildcard.
+        painter.circle_stroke(center, radius, Stroke::new(if hovered { 2.5 } else { 2.0 }, stroke));
+    }
+}
+
+fn card_group_widget(ui: &mut Ui, header: Rect, id: u64, kind: &mut BlockKind) -> bool {
+    let Some(group) = card_group_mut(kind) else { return false };
+    let before = *group;
+    let rect = card_group_dot_rect(header);
+    let response = ui
+        .interact(rect, egui::Id::new(("card_group", id)), Sense::click())
+        .on_hover_text(format!("Card group: {}", group.label()));
+    if response.hovered() {
+        paint_card_group_dot(ui.painter(), rect, *group, true);
+    }
+    egui::Popup::menu(&response).show(|ui| {
+        ui.set_min_width(130.0);
+        for option in CardGroup::ALL {
+            ui.horizontal(|ui| {
+                let (dot, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                paint_card_group_dot(ui.painter(), dot, option, false);
+                ui.selectable_value(group, option, option.label());
+            });
+        }
+    });
+    *group != before
+}
+
+fn card_group_dot_rect(header: Rect) -> Rect {
+    Rect::from_min_size(pos2(header.right() - 26.0, header.top() + 8.0), vec2(18.0, 18.0))
 }
 
 fn direction_of(kind: &mut BlockKind) -> Option<&mut Direction> {
@@ -235,8 +331,8 @@ fn field_text(kind: &BlockKind, field: Field) -> String {
 fn condition_field_text(c: &mut Condition, field: Field) -> String {
     match (field, &*c) {
         (Field::CondKind, _) => c.kind().label().to_string(),
-        (Field::CondColor, Condition::ColorIs { color }) => color.label().to_string(),
-        (Field::CondDevice, Condition::ButtonPressed { device }) => device.label().to_string(),
+        (Field::CondColor, Condition::ColorIs { color, .. }) => color.label().to_string(),
+        (Field::CondDevice, Condition::ButtonPressed { device, .. }) => device.label().to_string(),
         (Field::CondMotor, Condition::MotorPosition { motor, .. }) => motor.label().to_string(),
         (Field::CondLever, Condition::LeverPosition { lever, .. }) => lever.label().to_string(),
         (Field::CondDegrees, Condition::MotorPosition { degrees, .. }) => format!("{degrees}°"),
@@ -372,6 +468,10 @@ pub fn paint_block(painter: &Painter, rect: Rect, slots: &[(f32, f32)], kind: &B
         }
     }
 
+    if let Some(group) = card_group(kind) {
+        paint_card_group_dot(painter, card_group_dot_rect(header), group, false);
+    }
+
     if look.active && container {
         let (header_part, r) = parts[0];
         painter.rect_stroke(header_part.expand(1.0), r, Stroke::new(2.0, theme::HIGHLIGHT), StrokeKind::Outside);
@@ -493,8 +593,9 @@ pub fn field_widgets(ui: &mut Ui, header: Rect, id: u64, kind: &mut BlockKind) -
             }
         }
     }
+    let group_changed = card_group_widget(ui, header, id, kind);
     kind.sanitize();
-    *kind != before
+    *kind != before || group_changed
 }
 
 fn condition_widget(ui: &mut Ui, salt: (&str, u64, usize), frect: Rect, field: Field, c: &mut Condition) {
@@ -518,11 +619,11 @@ fn condition_widget(ui: &mut Ui, salt: (&str, u64, usize), frect: Rect, field: F
             }
         }
         _ => match c {
-            Condition::ColorIs { color } => {
+            Condition::ColorIs { color, .. } => {
                 let colors: Vec<LegoColor> = LegoColor::ALL.into_iter().filter(|c| *c != LegoColor::None).collect();
                 combo(ui, salt, w, color, &colors, |c| c.label().into());
             }
-            Condition::ButtonPressed { device } => combo(ui, salt, w, device, &DeviceKind::ALL, |d| d.label().into()),
+            Condition::ButtonPressed { device, .. } => combo(ui, salt, w, device, &DeviceKind::ALL, |d| d.label().into()),
             Condition::MotorPosition { motor, degrees, .. } => {
                 if field == Field::CondMotor {
                     combo(ui, salt, w, motor, &[Motor::Single, Motor::DoubleLeft, Motor::DoubleRight], |m| m.label().into());

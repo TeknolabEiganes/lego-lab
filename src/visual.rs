@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::hardware::{Direction, Motor};
+use crate::hardware::{CardGroup, Direction, Motor};
 use crate::program::condition::Condition;
 
 pub type BlockId = u64;
@@ -31,23 +31,33 @@ pub enum BlockKind {
     WhenRun,
     RunMotor {
         motor: Motor,
+        #[serde(default)]
+        group: CardGroup,
         direction: Direction,
         speed: i32,
     },
     StopMotor {
         motor: Motor,
+        #[serde(default)]
+        group: CardGroup,
     },
     ResetPosition {
         motor: Motor,
+        #[serde(default)]
+        group: CardGroup,
     },
     MotorForTime {
         motor: Motor,
+        #[serde(default)]
+        group: CardGroup,
         direction: Direction,
         speed: i32,
         seconds: f32,
     },
     MotorRotations {
         motor: Motor,
+        #[serde(default)]
+        group: CardGroup,
         direction: Direction,
         speed: i32,
         rotations: f32,
@@ -78,11 +88,11 @@ impl BlockKind {
         let condition = Condition::default();
         vec![
             BlockKind::WhenRun,
-            BlockKind::RunMotor { motor, direction, speed: 50 },
-            BlockKind::StopMotor { motor },
-            BlockKind::MotorForTime { motor, direction, speed: 50, seconds: 1.0 },
-            BlockKind::MotorRotations { motor, direction, speed: 50, rotations: 1.0 },
-            BlockKind::ResetPosition { motor },
+            BlockKind::RunMotor { motor, group: CardGroup::NoCard, direction, speed: 50 },
+            BlockKind::StopMotor { motor, group: CardGroup::NoCard },
+            BlockKind::MotorForTime { motor, group: CardGroup::NoCard, direction, speed: 50, seconds: 1.0 },
+            BlockKind::MotorRotations { motor, group: CardGroup::NoCard, direction, speed: 50, rotations: 1.0 },
+            BlockKind::ResetPosition { motor, group: CardGroup::NoCard },
             BlockKind::Wait { seconds: 1.0 },
             BlockKind::Repeat { count: 4 },
             BlockKind::Forever,
@@ -298,9 +308,9 @@ impl Workspace {
         let motor = Motor::Single;
         let blocks = vec![
             ws.make_block(BlockKind::WhenRun),
-            ws.make_block(BlockKind::RunMotor { motor, direction: Direction::Clockwise, speed: 50 }),
+            ws.make_block(BlockKind::RunMotor { motor, group: CardGroup::NoCard, direction: Direction::Clockwise, speed: 50 }),
             ws.make_block(BlockKind::Wait { seconds: 2.0 }),
-            ws.make_block(BlockKind::StopMotor { motor }),
+            ws.make_block(BlockKind::StopMotor { motor, group: CardGroup::NoCard }),
         ];
         ws.stacks.push(Stack { pos: [80.0, 60.0], blocks });
         ws
@@ -384,6 +394,22 @@ impl Workspace {
         copy.body = block.body.iter().map(|b| self.fresh_copy(b)).collect();
         copy.else_body = block.else_body.iter().map(|b| self.fresh_copy(b)).collect();
         copy
+    }
+
+    /// Copy a block template and the position of its containing stack.
+    pub fn copy_block_template(&self, id: BlockId) -> Option<(Block, [f32; 2])> {
+        let path = self.find(id)?;
+        let block = self.block(&path)?.clone();
+        let pos = self.stacks.get(path.seq.stack)?.pos;
+        Some((block, pos))
+    }
+
+    /// Paste a fresh copy of a block template as a new stack at `pos`.
+    pub fn paste_block_copy(&mut self, template: &Block, pos: [f32; 2]) -> BlockId {
+        let copy = self.fresh_copy(template);
+        let id = copy.id;
+        self.add_stack(pos, vec![copy]);
+        id
     }
 
     /// Duplicate a block (and its contents) into a new stack beside the
@@ -528,10 +554,10 @@ pub(crate) mod tests {
         let hat = ws.make_block(BlockKind::WhenRun);
         let mut forever = ws.make_block(BlockKind::Forever);
         let mut if_else = ws.make_block(BlockKind::IfElse {
-            condition: Condition::ColorIs { color: crate::hardware::LegoColor::Red },
+            condition: Condition::ColorIs { color: crate::hardware::LegoColor::Red, group: CardGroup::NoCard },
         });
-        if_else.body.push(ws.make_block(BlockKind::RunMotor { motor, direction: Direction::Clockwise, speed: 100 }));
-        if_else.else_body.push(ws.make_block(BlockKind::StopMotor { motor }));
+        if_else.body.push(ws.make_block(BlockKind::RunMotor { motor, group: CardGroup::NoCard, direction: Direction::Clockwise, speed: 100 }));
+        if_else.else_body.push(ws.make_block(BlockKind::StopMotor { motor, group: CardGroup::NoCard }));
         forever.body.push(if_else);
         ws.add_stack([0.0, 0.0], vec![hat, forever]);
         ws
@@ -593,6 +619,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn copy_paste_makes_a_fresh_deep_copy() {
+        let mut ws = colour_program();
+        let source_id = ws.stacks[0].blocks[1].id;
+        let (template, _) = ws.copy_block_template(source_id).unwrap();
+        let pasted_id = ws.paste_block_copy(&template, [500.0, 20.0]);
+        let pasted = ws.block(&ws.find(pasted_id).unwrap()).unwrap();
+
+        assert_eq!(pasted.kind, template.kind);
+        assert_eq!(pasted.body.len(), template.body.len());
+        let mut source_ids = std::collections::HashSet::new();
+        let mut pasted_ids = std::collections::HashSet::new();
+        ws.block(&ws.find(source_id).unwrap()).unwrap().walk(&mut |b| {
+            source_ids.insert(b.id);
+        });
+        pasted.walk(&mut |b| {
+            assert!(pasted_ids.insert(b.id), "duplicate id {} within pasted block", b.id);
+            assert!(!source_ids.contains(&b.id), "pasted block reused source id {}", b.id);
+        });
+    }
+
+    #[test]
     fn sanitize_repairs_bad_input() {
         let json = r#"{"stacks":[{"pos":[0,0],"blocks":[
             {"id":1,"type":"run_motor","motor":"Single","direction":"Clockwise","speed":9000},
@@ -607,7 +654,7 @@ pub(crate) mod tests {
         assert_eq!(ws.stacks.len(), 3, "hat and forever split the stack");
         assert_eq!(
             ws.stacks[0].blocks[0].kind,
-            BlockKind::RunMotor { motor: Motor::Single, direction: Direction::Clockwise, speed: 100 }
+            BlockKind::RunMotor { motor: Motor::Single, group: CardGroup::NoCard, direction: Direction::Clockwise, speed: 100 }
         );
         let wait = &ws.stacks[1].blocks[1];
         assert_eq!(wait.kind, BlockKind::Wait { seconds: 0.0 });
@@ -615,7 +662,7 @@ pub(crate) mod tests {
         assert!(ws.stacks[1].blocks[2].body.is_empty(), "hat removed from forever body");
         assert_eq!(
             ws.stacks[2].blocks[1].kind,
-            BlockKind::If { condition: Condition::Reflection { cmp: Comparison::Less, percent: 100 } }
+            BlockKind::If { condition: Condition::Reflection { cmp: Comparison::Less, percent: 100, group: CardGroup::NoCard } }
         );
         let mut ids = std::collections::HashSet::new();
         for s in &ws.stacks {

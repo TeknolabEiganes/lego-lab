@@ -53,13 +53,23 @@ pub struct Editor {
     pub view: View,
     pub drag: Option<Drag>,
     pub selected: Option<BlockId>,
+    clipboard: Option<(Block, [f32; 2])>,
+    paste_count: u32,
     /// Screen rect of the palette this frame (drop there to delete).
     pub palette_rect: Rect,
 }
 
 impl Editor {
     pub fn new(ws: Workspace) -> Self {
-        Self { ws, view: View::default(), drag: None, selected: None, palette_rect: Rect::NOTHING }
+        Self {
+            ws,
+            view: View::default(),
+            drag: None,
+            selected: None,
+            clipboard: None,
+            paste_count: 0,
+            palette_rect: Rect::NOTHING,
+        }
     }
 
     pub fn delete_selected(&mut self) -> bool {
@@ -272,6 +282,16 @@ enum Target {
     Free,
 }
 
+fn paint_drag_payload(painter: &egui::Painter, payload: &Payload, pos: Pos2, fade: f32) {
+    match payload {
+        Payload::Blocks(chain) => paint_chain(painter, pos, chain, fade),
+        Payload::Condition(condition) => {
+            let rect = Rect::from_min_size(pos, CONDITION_GHOST);
+            block::paint_condition_chip(painter, rect, &condition.describe(), false, fade);
+        }
+    }
+}
+
 /// Draw and interact with the canvas. Returns true if the program changed.
 pub fn show(ui: &mut Ui, ed: &mut Editor, info: &CanvasInfo) -> bool {
     let mut changed = false;
@@ -390,23 +410,21 @@ pub fn show(ui: &mut Ui, ed: &mut Editor, info: &CanvasInfo) -> bool {
     if let Some(drag) = &ed.drag
         && pointer.is_some()
     {
-        let ghost_layer = LayerId::new(Order::Tooltip, Id::new("drag_ghost"));
-        ctx.set_transform_layer(ghost_layer, transform);
-        let gp = ctx.layer_painter(ghost_layer);
-        let over_palette = pointer.is_some_and(|p| ed.palette_rect.contains(p));
-        let fade = if over_palette { 0.45 } else { 0.95 };
-        match &drag.payload {
-            Payload::Blocks(chain) => {
-                let pos = match &target {
-                    Target::Insert { pos, .. } => *pos,
-                    _ => ghost,
-                };
-                paint_chain(&gp, pos, chain, fade);
-            }
-            Payload::Condition(c) => {
-                let r = Rect::from_min_size(ghost, CONDITION_GHOST);
-                block::paint_condition_chip(&gp, r, &c.describe(), false, fade);
-            }
+        let p = pointer.unwrap();
+        let pos = match &target {
+            Target::Insert { pos, .. } => *pos,
+            _ => ghost,
+        };
+        if rect.contains(p) {
+            // Draw in the canvas's already-transformed layer. This keeps the
+            // drag preview aligned with the blocks at every zoom level.
+            paint_drag_payload(&cui.painter(), &drag.payload, pos, 1.0);
+        } else {
+            let ghost_layer = LayerId::new(Order::Tooltip, Id::new("drag_ghost"));
+            ctx.set_transform_layer(ghost_layer, transform);
+            let gp = ctx.layer_painter(ghost_layer);
+            let fade = if ed.palette_rect.contains(p) { 0.45 } else { 0.95 };
+            paint_drag_payload(&gp, &drag.payload, pos, fade);
         }
     }
 
@@ -474,8 +492,34 @@ pub fn show(ui: &mut Ui, ed: &mut Editor, info: &CanvasInfo) -> bool {
     }
 
     let typing = ctx.memory(|m| m.focused().is_some());
-    if !typing && ctx.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)) {
-        changed |= ed.delete_selected();
+    if !typing && !egui::Popup::is_any_open(&ctx) && ed.drag.is_none() {
+        let (copy, paste, delete) = ctx.input(|i| {
+            (
+                i.modifiers.command && i.key_pressed(Key::C),
+                i.modifiers.command && i.key_pressed(Key::V),
+                i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace),
+            )
+        });
+        if copy && let Some(id) = ed.selected && let Some(template) = ed.ws.copy_block_template(id) {
+            ed.clipboard = Some(template);
+            ed.paste_count = 0;
+        }
+        if paste && let Some((template, origin)) = ed.clipboard.clone() {
+            let offset = ed.paste_count.min(10) as f32 * 24.0;
+            let pos = if let Some(pointer) = pointer.filter(|p| rect.contains(*p)) {
+                let canvas_pos = to_canvas(pointer) - vec2(40.0, 18.0) + vec2(offset, offset);
+                [canvas_pos.x, canvas_pos.y]
+            } else {
+                [origin[0] + 300.0 + offset, origin[1] + offset]
+            };
+            let id = ed.ws.paste_block_copy(&template, pos);
+            ed.selected = Some(id);
+            ed.paste_count = ed.paste_count.saturating_add(1);
+            changed = true;
+        }
+        if delete {
+            changed |= ed.delete_selected();
+        }
     }
 
     if ed.drag.is_some() {

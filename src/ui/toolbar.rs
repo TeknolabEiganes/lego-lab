@@ -16,7 +16,7 @@ impl Backend {
     pub fn label(self) -> &'static str {
         match self {
             Backend::Simulator => "Simulator",
-            Backend::Bluetooth => "LEGO Bluetooth",
+            Backend::Bluetooth => "Bluetooth",
         }
     }
 }
@@ -32,7 +32,9 @@ pub enum ToolbarAction {
     SelectBackend(Backend),
     Run,
     Stop,
-    ToggleSimulator,
+    ToggleBlocks,
+    TogglePanel,
+    TogglePanes,
 }
 
 pub struct ToolbarState<'a> {
@@ -41,7 +43,6 @@ pub struct ToolbarState<'a> {
     pub connection: ConnectionState,
     pub backend: Backend,
     pub running: bool,
-    pub show_simulator: bool,
 }
 
 fn logo(ui: &mut Ui) {
@@ -87,6 +88,9 @@ fn connection_indicator(ui: &mut Ui, state: ConnectionState, with_text: bool) {
 
 pub fn show(ui: &mut Ui, st: ToolbarState) -> Vec<ToolbarAction> {
     let mut actions = Vec::new();
+    let toolbar_rect = ui.max_rect();
+    let wide = toolbar_rect.width() > 1100.0;
+    let name_width = if wide { 160.0 } else { 110.0 };
     ui.horizontal_centered(|ui| {
         ui.add_space(6.0);
         logo(ui);
@@ -107,11 +111,10 @@ pub fn show(ui: &mut Ui, st: ToolbarState) -> Vec<ToolbarAction> {
                 actions.push(ToolbarAction::SaveAs);
             }
         });
-        let wide = ui.available_width() > 1100.0;
-        if ui.available_width() > 820.0 {
+        if toolbar_rect.width() > 820.0 {
             ui.add(
                 egui::TextEdit::singleline(st.project_name)
-                    .desired_width(if wide { 160.0 } else { 110.0 })
+                    .desired_width(name_width)
                     .hint_text("Project name"),
             );
         }
@@ -130,26 +133,18 @@ pub fn show(ui: &mut Ui, st: ToolbarState) -> Vec<ToolbarAction> {
             }
             ui.add_space(16.0);
 
-            let panel = if st.backend == Backend::Simulator { "simulator" } else { "devices" };
-            let panel_text = match (st.show_simulator, wide) {
-                (true, true) => format!("Hide {panel}"),
-                (false, true) => format!("Show {panel}"),
-                _ => panel[..1].to_uppercase() + &panel[1..],
-            };
-            if ui.button(panel_text).clicked() {
-                actions.push(ToolbarAction::ToggleSimulator);
-            }
             match st.connection {
-                ConnectionState::Disconnected => {
+                ConnectionState::Disconnected if st.backend == Backend::Simulator => {
                     if ui.button(RichText::new("Connect").strong()).clicked() {
                         actions.push(ToolbarAction::Connect);
                     }
                 }
-                _ => {
+                ConnectionState::Connected | ConnectionState::Connecting => {
                     if ui.button("Disconnect").clicked() {
                         actions.push(ToolbarAction::Disconnect);
                     }
                 }
+                ConnectionState::Disconnected => {}
             }
             egui::ComboBox::from_id_salt("backend")
                 .selected_text(st.backend.label())

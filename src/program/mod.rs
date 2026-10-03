@@ -5,7 +5,7 @@ pub mod condition;
 
 use serde::{Deserialize, Serialize};
 
-use crate::hardware::{Direction, Motor, Speed};
+use crate::hardware::{CardGroup, Direction, Motor, Speed};
 use crate::visual::BlockId;
 
 pub use condition::Condition;
@@ -15,26 +15,31 @@ pub use condition::Condition;
 pub enum Command {
     MotorRun {
         motor: Motor,
+        group: CardGroup,
         direction: Direction,
         speed: Speed,
     },
     MotorRunForTime {
         motor: Motor,
+        group: CardGroup,
         direction: Direction,
         speed: Speed,
         milliseconds: u64,
     },
     MotorRunForDegrees {
         motor: Motor,
+        group: CardGroup,
         direction: Direction,
         speed: Speed,
         degrees: u32,
     },
     MotorStop {
         motor: Motor,
+        group: CardGroup,
     },
     MotorResetPosition {
         motor: Motor,
+        group: CardGroup,
     },
     Wait {
         milliseconds: u64,

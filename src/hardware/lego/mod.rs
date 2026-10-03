@@ -2,8 +2,9 @@
 //!
 //! Every device (Single Motor, Double Motor, Colour Sensor, Controller) is
 //! its own BLE peripheral. On connect we scan for the LEGO service, connect
-//! to one device of each kind (the strongest signal) and keep a [`Link`] per
-//! device. Wire formats live in [`protocol`]; see docs/lego-hardware.md.
+//! to every selected peripheral and keep a [`Link`] per device. Programs route
+//! by device kind and connection-card colour group. Wire formats live in
+//! [`protocol`]; see docs/lego-hardware.md.
 
 pub mod protocol;
 
@@ -22,7 +23,7 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use super::{
-    AttachedDevice, ConnectionState, DeviceKind, DeviceSnapshot, Direction, HardwareError,
+    AttachedDevice, CardGroup, ConnectionState, DeviceKind, DeviceSnapshot, Direction, HardwareError,
     HwResult, LegoDevice, Lever, Motor, SensorQuery, SensorValue, Speed,
 };
 use protocol::{Advert, CommandStatus, Notification, ResponseKey};
@@ -84,6 +85,12 @@ impl Link {
             Some((color, serial)) => protocol::card_label(color, serial),
             None => self.advert.card(),
         }
+    }
+
+    fn group(&self) -> CardGroup {
+        let live = self.live.lock().unwrap_or_else(|e| e.into_inner()).card;
+        let color = live.map_or(self.advert.card_color, |(color, _)| color);
+        CardGroup::from_firmware(color)
     }
 
     fn is_alive(&self) -> bool {
@@ -190,6 +197,7 @@ pub struct FoundDevice {
     /// Bluetooth address; identifies the device for `connect_device`.
     pub address: String,
     pub kind: DeviceKind,
+    pub group: CardGroup,
     /// Connection card, e.g. "blue 3683".
     pub card: String,
     pub rssi: Option<i16>,
@@ -381,11 +389,12 @@ impl LegoBleDevice {
         self.shared.links.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|l| l.is_alive()).cloned().collect()
     }
 
-    fn link(&self, kind: DeviceKind) -> HwResult<Arc<Link>> {
+    fn links_for(&self, kind: DeviceKind, group: CardGroup) -> HwResult<Vec<Arc<Link>>> {
         if self.connection() != ConnectionState::Connected {
             return Err(HardwareError::NotConnected);
         }
-        self.links().into_iter().find(|l| l.kind == kind).ok_or(HardwareError::DeviceMissing(kind))
+        let links: Vec<_> = self.links().into_iter().filter(|l| l.kind == kind && l.group() == group).collect();
+        if links.is_empty() { Err(HardwareError::DeviceMissing(kind)) } else { Ok(links) }
     }
 
     /// Bluetooth addresses of the connected devices.
@@ -422,21 +431,11 @@ impl LegoBleDevice {
         });
     }
 
-    /// Add a connected device, replacing any other device of the same kind
-    /// (blocks address devices by kind).
+    /// Add a connected device, retaining other devices of the same kind.
     async fn add_link(&self, link: Arc<Link>) {
-        let replaced: Vec<Arc<Link>> = {
-            let mut links = self.shared.links.lock().unwrap_or_else(|e| e.into_inner());
-            let (old, keep): (Vec<_>, Vec<_>) =
-                links.drain(..).partition(|l| l.kind == link.kind || !l.is_alive());
-            *links = keep;
-            links.push(link);
-            old
-        };
-        for old in replaced {
-            old.mark_dead();
-            let _ = old.peripheral.disconnect().await;
-        }
+        let mut links = self.shared.links.lock().unwrap_or_else(|e| e.into_inner());
+        links.retain(|l| l.is_alive());
+        links.push(link);
     }
 
     /// Scan for every LEGO device in range.
@@ -449,6 +448,7 @@ impl LegoBleDevice {
             .map(|(p, a, rssi)| FoundDevice {
                 address: p.address().to_string(),
                 kind: a.kind,
+                group: CardGroup::from_firmware(a.card_color),
                 card: a.card(),
                 rssi: *rssi,
             })
@@ -464,8 +464,42 @@ impl LegoBleDevice {
         self.shared.found_list.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Connect one device from the last scan.
+    /// Connect devices from the most recent scan, optionally filtered by card group.
+    pub async fn connect_matching_found(&self, group: Option<CardGroup>) -> HwResult<()> {
+        let _busy = self.busy();
+        let found: Vec<_> = self
+            .last_scan()
+            .into_iter()
+            .filter(|device| group.is_none_or(|group| device.group == group))
+            .collect();
+        if found.is_empty() {
+            let message = group.map_or_else(
+                || "scan for devices before connecting all".to_string(),
+                |group| format!("no devices in the {} group were found in the latest scan", group.label()),
+            );
+            return Err(comm(message));
+        }
+        self.connect_found(&found).await
+    }
+
+    async fn connect_found(&self, found: &[FoundDevice]) -> HwResult<()> {
+        let attempts = futures::future::join_all(found.iter().map(|d| self.connect_device(&d.address))).await;
+        let mut first_error = None;
+        for e in attempts.into_iter().filter_map(Result::err) {
+            eprintln!("LEGO Lab: {e}");
+            first_error.get_or_insert(e);
+        }
+        match first_error {
+            Some(e) if self.links().is_empty() => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    /// Connect one device from the last scan, without replacing same-kind links.
     pub async fn connect_device(&self, address: &str) -> HwResult<()> {
+        if self.links().iter().any(|link| link.peripheral.address().to_string() == address) {
+            return Ok(());
+        }
         let entry = self
             .shared
             .found
@@ -497,14 +531,29 @@ impl LegoBleDevice {
         Ok(())
     }
 
-    async fn run_with_speed(&self, motor: Motor, speed: Speed, command: Vec<u8>, result: u8, timeout: Duration) -> HwResult<()> {
-        let link = self.link(motor.device())?;
+    async fn run_with_speed(
+        &self,
+        motor: Motor,
+        group: CardGroup,
+        speed: Speed,
+        command: Vec<u8>,
+        result: u8,
+        timeout: Duration,
+    ) -> HwResult<()> {
+        let links = self.links_for(motor.device(), group)?;
         let mask = protocol::motor_mask(motor);
-        link.last_run.lock().unwrap_or_else(|e| e.into_inner()).remove(&mask);
         // Speed is a separate message, sent in the same write (as LEGO's package does).
         let mut data = protocol::motor_set_speed(mask, speed.percent() as i8);
         data.extend(command);
-        link.motor_command(&data, result, mask, timeout).await
+        let results = futures::future::join_all(links.into_iter().map(|link| {
+            let data = data.clone();
+            async move {
+                link.last_run.lock().unwrap_or_else(|e| e.into_inner()).remove(&mask);
+                link.motor_command(&data, result, mask, timeout).await
+            }
+        }))
+        .await;
+        results.into_iter().find(|r| r.is_err()).unwrap_or(Ok(()))
     }
 }
 
@@ -538,7 +587,7 @@ fn motor_index(motor: Motor) -> usize {
 #[async_trait]
 impl LegoDevice for LegoBleDevice {
     fn backend_name(&self) -> &'static str {
-        "LEGO Bluetooth"
+        "Bluetooth"
     }
 
     fn connection(&self) -> ConnectionState {
@@ -551,7 +600,7 @@ impl LegoDevice for LegoBleDevice {
         }
     }
 
-    /// Scan and connect the strongest-signal device of each kind.
+    /// Scan and connect every discovered device.
     async fn connect(&self) -> HwResult<()> {
         let _busy = self.busy();
         let found = self.scan_devices().await?;
@@ -560,23 +609,7 @@ impl LegoDevice for LegoBleDevice {
                 "no LEGO devices found. Switch them on and check their light is blinking (ready to connect)",
             ));
         }
-        let mut best: Vec<&FoundDevice> = Vec::new();
-        for d in &found {
-            // `found` is sorted strongest-first within each kind.
-            if !best.iter().any(|b| b.kind == d.kind) {
-                best.push(d);
-            }
-        }
-        let attempts = futures::future::join_all(best.iter().map(|d| self.connect_device(&d.address))).await;
-        let mut first_error = None;
-        for e in attempts.into_iter().filter_map(Result::err) {
-            eprintln!("LEGO Lab: {e}");
-            first_error.get_or_insert(e);
-        }
-        match first_error {
-            Some(e) if self.links().is_empty() => Err(e),
-            _ => Ok(()),
-        }
+        self.connect_found(&found).await
     }
 
     async fn disconnect(&self) -> HwResult<()> {
@@ -593,59 +626,96 @@ impl LegoDevice for LegoBleDevice {
         if self.connection() != ConnectionState::Connected {
             return Err(HardwareError::NotConnected);
         }
-        Ok(self.links().iter().map(|l| AttachedDevice { kind: l.kind, name: l.card() }).collect())
+        Ok(self
+            .links()
+            .iter()
+            .map(|l| AttachedDevice {
+                kind: l.kind,
+                group: l.group(),
+                name: l.card(),
+            })
+            .collect())
     }
 
-    async fn motor_run(&self, motor: Motor, direction: Direction, speed: Speed) -> HwResult<()> {
-        let link = self.link(motor.device())?;
+    async fn motor_run(&self, motor: Motor, group: CardGroup, direction: Direction, speed: Speed) -> HwResult<()> {
+        let links = self.links_for(motor.device(), group)?;
         let mask = protocol::motor_mask(motor);
         let pct = speed.percent();
-        let repeated = link
-            .last_run
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&mask)
-            .is_some_and(|(s, d, t)| *s == pct && *d == direction && t.elapsed() < DEDUPE_WINDOW);
-        if repeated {
-            return Ok(());
-        }
-        let mut data = protocol::motor_set_speed(mask, pct as i8);
-        data.extend(protocol::motor_run(mask, direction));
-        link.motor_command(&data, protocol::MOTOR_RUN_RESULT, mask, REPLY_TIMEOUT).await?;
-        link.last_run.lock().unwrap_or_else(|e| e.into_inner()).insert(mask, (pct, direction, Instant::now()));
-        Ok(())
+        let results = futures::future::join_all(links.into_iter().map(|link| async move {
+            let repeated = link
+                .last_run
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&mask)
+                .is_some_and(|(s, d, t)| *s == pct && *d == direction && t.elapsed() < DEDUPE_WINDOW);
+            if repeated {
+                return Ok(());
+            }
+            let mut data = protocol::motor_set_speed(mask, pct as i8);
+            data.extend(protocol::motor_run(mask, direction));
+            link.motor_command(&data, protocol::MOTOR_RUN_RESULT, mask, REPLY_TIMEOUT).await?;
+            link.last_run.lock().unwrap_or_else(|e| e.into_inner()).insert(mask, (pct, direction, Instant::now()));
+            Ok(())
+        }))
+        .await;
+        results.into_iter().find(|r| r.is_err()).unwrap_or(Ok(()))
     }
 
-    async fn motor_run_for_time(&self, motor: Motor, direction: Direction, speed: Speed, duration: Duration) -> HwResult<()> {
+    async fn motor_run_for_time(
+        &self,
+        motor: Motor,
+        group: CardGroup,
+        direction: Direction,
+        speed: Speed,
+        duration: Duration,
+    ) -> HwResult<()> {
         let ms = duration.as_millis().min(u32::MAX as u128) as u32;
         let mask = protocol::motor_mask(motor);
         let command = protocol::motor_run_for_time(mask, ms, direction);
-        self.run_with_speed(motor, speed, command, protocol::MOTOR_RUN_FOR_TIME_RESULT, duration + Duration::from_secs(5))
+        self.run_with_speed(motor, group, speed, command, protocol::MOTOR_RUN_FOR_TIME_RESULT, duration + Duration::from_secs(5))
             .await
     }
 
-    async fn motor_run_for_degrees(&self, motor: Motor, direction: Direction, speed: Speed, degrees: u32) -> HwResult<()> {
+    async fn motor_run_for_degrees(
+        &self,
+        motor: Motor,
+        group: CardGroup,
+        direction: Direction,
+        speed: Speed,
+        degrees: u32,
+    ) -> HwResult<()> {
         let mask = protocol::motor_mask(motor);
         let degrees = degrees.min(i32::MAX as u32) as i32;
         let command = protocol::motor_run_for_degrees(mask, degrees, direction);
         // Generous upper bound: the motor itself reports when it is done.
         let estimate = degrees as f64 / (speed.percent().max(1) as f64 * 3.0);
         let timeout = Duration::from_secs_f64(estimate + 10.0);
-        self.run_with_speed(motor, speed, command, protocol::MOTOR_RUN_FOR_DEGREES_RESULT, timeout).await
+        self.run_with_speed(motor, group, speed, command, protocol::MOTOR_RUN_FOR_DEGREES_RESULT, timeout).await
     }
 
-    async fn motor_stop(&self, motor: Motor) -> HwResult<()> {
-        let link = self.link(motor.device())?;
+    async fn motor_stop(&self, motor: Motor, group: CardGroup) -> HwResult<()> {
+        let links = self.links_for(motor.device(), group)?;
         let mask = protocol::motor_mask(motor);
-        link.last_run.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        link.motor_command(&protocol::motor_stop(mask), protocol::MOTOR_STOP_RESULT, mask, REPLY_TIMEOUT).await
+        let results = futures::future::join_all(links.into_iter().map(|link| async move {
+            link.last_run.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            link.motor_command(&protocol::motor_stop(mask), protocol::MOTOR_STOP_RESULT, mask, REPLY_TIMEOUT).await
+        }))
+        .await;
+        results.into_iter().find(|r| r.is_err()).unwrap_or(Ok(()))
     }
 
-    async fn motor_reset_position(&self, motor: Motor) -> HwResult<()> {
-        let link = self.link(motor.device())?;
+    async fn motor_reset_position(&self, motor: Motor, group: CardGroup) -> HwResult<()> {
+        let links = self.links_for(motor.device(), group)?;
         let mask = protocol::motor_mask(motor);
         let data = protocol::motor_reset_relative_position(mask, 0);
-        link.motor_command(&data, protocol::MOTOR_RESET_RELATIVE_POSITION_RESULT, mask, REPLY_TIMEOUT).await
+        let results = futures::future::join_all(links.into_iter().map(|link| {
+            let data = data.clone();
+            async move {
+                link.motor_command(&data, protocol::MOTOR_RESET_RELATIVE_POSITION_RESULT, mask, REPLY_TIMEOUT).await
+            }
+        }))
+        .await;
+        results.into_iter().find(|r| r.is_err()).unwrap_or(Ok(()))
     }
 
     async fn reset_motor_positions(&self) -> HwResult<()> {
@@ -671,25 +741,30 @@ impl LegoDevice for LegoBleDevice {
         results.into_iter().find(|r| r.is_err()).unwrap_or(Ok(()))
     }
 
-    async fn read_sensor(&self, query: SensorQuery) -> HwResult<SensorValue> {
+    async fn read_sensors(&self, query: SensorQuery, group: CardGroup) -> HwResult<Vec<SensorValue>> {
         let kind = match query {
             SensorQuery::Color | SensorQuery::Reflection => DeviceKind::ColorSensor,
             SensorQuery::MotorPosition(m) => m.device(),
             SensorQuery::ControllerLever(_) => DeviceKind::Controller,
             SensorQuery::Button(k) => k,
         };
-        let link = self.link(kind)?;
-        let live = link.live.lock().unwrap_or_else(|e| e.into_inner());
-        match query {
-            SensorQuery::Color => live.color.map(|(c, _)| SensorValue::Color(protocol::sensor_color(c))),
-            SensorQuery::Reflection => live.color.map(|(_, r)| SensorValue::Percent(r as i32)),
-            SensorQuery::MotorPosition(m) => live.motor_position[motor_index(m)].map(|p| SensorValue::Degrees(p as i64)),
-            SensorQuery::ControllerLever(lever) => live.levers.map(|(l, r)| {
-                SensorValue::Percent(if lever == Lever::Left { l } else { r } as i32)
-            }),
-            SensorQuery::Button(_) => Some(SensorValue::Pressed(live.button)),
-        }
-        .ok_or_else(|| no_reading(kind))
+        let links = self.links_for(kind, group)?;
+        let values: Vec<SensorValue> = links
+            .iter()
+            .filter_map(|link| {
+                let live = link.live.lock().unwrap_or_else(|e| e.into_inner());
+                match query {
+                    SensorQuery::Color => live.color.map(|(c, _)| SensorValue::Color(protocol::sensor_color(c))),
+                    SensorQuery::Reflection => live.color.map(|(_, r)| SensorValue::Percent(r as i32)),
+                    SensorQuery::MotorPosition(m) => live.motor_position[motor_index(m)].map(|p| SensorValue::Degrees(p as i64)),
+                    SensorQuery::ControllerLever(lever) => live.levers.map(|(l, r)| {
+                        SensorValue::Percent(if lever == Lever::Left { l } else { r } as i32)
+                    }),
+                    SensorQuery::Button(_) => Some(SensorValue::Pressed(live.button)),
+                }
+            })
+            .collect();
+        if values.is_empty() { Err(no_reading(kind)) } else { Ok(values) }
     }
 
     fn snapshot(&self) -> Vec<DeviceSnapshot> {
@@ -697,6 +772,7 @@ impl LegoDevice for LegoBleDevice {
             .iter()
             .map(|link| {
                 let card = link.card();
+                let group = link.group();
                 let live = link.live.lock().unwrap_or_else(|e| e.into_inner());
                 let mut readings = Vec::new();
                 let motor = |r: &mut Vec<(String, String)>, label: &str, i: usize| {
@@ -730,6 +806,7 @@ impl LegoDevice for LegoBleDevice {
                 readings.push(("Button".into(), if live.button { "pressed" } else { "—" }.into()));
                 DeviceSnapshot {
                     kind: link.kind,
+                    group,
                     address: link.peripheral.address().to_string(),
                     card,
                     battery: live.battery,

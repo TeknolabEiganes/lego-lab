@@ -55,7 +55,7 @@ cargo test
 
 ## Using it
 
-1. The app starts in **LEGO Bluetooth** mode, scans for LEGO devices and
+1. The app starts in **Bluetooth** mode, scans for LEGO devices and
    lists them in the devices panel on the right (see *Real LEGO hardware*
    below). It opens with a starter program:
    *When Run → Run Motor 50% → Wait 2 s → Stop Motor*.
@@ -74,8 +74,10 @@ Editing:
 | Move / reorder / disconnect | drag a block; the blocks below come with it |
 | Edit a parameter | click or drag the white fields inside a block |
 | Select | click a block |
+| Copy / paste selected block | Ctrl+C / Ctrl+V (Cmd+C / Cmd+V on macOS) |
 | Delete | select + Delete/Backspace, right-click → Delete, or drag onto the palette |
 | Duplicate | right-click → Duplicate |
+| Toggle Blocks / Devices panes | Ctrl+1 / Ctrl+2; Ctrl+F toggles both (Cmd on macOS) |
 | Pan | drag the empty canvas, or scroll |
 | Zoom | Ctrl + scroll, pinch, or the − / % / + buttons (% resets) |
 | Files | ☰ File menu, Ctrl+N / Ctrl+O / Ctrl+S / Ctrl+Shift+S |
@@ -105,6 +107,14 @@ Wait Until block to set its condition, or drop it on the empty canvas to get
 a *Wait Until* block. You can also change the condition with the dropdowns
 inside the block.
 
+Motor blocks and sensor conditions have a card-group dot at the top right. A
+hollow white dot means **No card**: target all connected devices of that kind
+without a connection card. Click the dot to choose a card colour; a filled dot
+targets all same-kind devices with that card colour. Motors in a selected
+group all receive the command; a sensor condition is true if any matching
+device's latest reading satisfies it. Card colour identifies the device
+group—it is separate from the colour a Colour Sensor detects.
+
 ### Example
 
 `examples/colour-motor.legolab` is the program from the plan:
@@ -131,15 +141,18 @@ Motor four times, each time waiting for you to hold the Controller's button.
 1. Switch on your LEGO devices. Their light blinks when they are ready to
    connect. If they have never been used, update their firmware once at
    <https://code.legoeducation.com>.
-2. Start LEGO Lab (it starts in **LEGO Bluetooth** mode). The **devices**
+2. Start LEGO Lab (it starts in **Bluetooth** mode). The **Devices**
    panel scans and lists every LEGO device nearby with its connection card
    (colour and number). Press **🔍 Scan** to look again.
-3. Press **Connect** next to the devices you want. Blocks address devices
-   by type, so connecting a second Single Motor replaces the first. Press
-   Connected devices show their battery and live readings.
+3. Press **Connect** next to each device you want. You can connect multiple
+    devices of the same type; blocks route to them by motor/sensor type and
+    card-colour group. Connected devices show their card, battery and live
+    readings.
 
-   The toolbar's **Connect** button is a shortcut: it scans and connects
-   the closest device of each type.
+    The **Card colour** filter narrows the device list. **Connect all** (or
+    **Connect filtered**) connects every device from the latest scan, either
+    unfiltered or matching the selected card colour. In a busy classroom, use
+    the individual Connect buttons to choose devices.
 4. Press RUN as usual.
 
 From a terminal:
@@ -161,8 +174,8 @@ program stops and every motor is told to stop.
 The simulator panel simulates every device in the kits: Single Motor, Double
 Motor (left/right), Colour Sensor (pick a colour, set reflection), Controller
 (two levers) and each device's button (hold to press). You can switch
-devices on and off to see how the app reacts to missing hardware, and there
-is a timestamped command log.
+devices on and off, assign each simulated device a card group, and see how the
+app reacts to missing hardware. There is also a timestamped command log.
 
 ## The hardware (short version)
 
@@ -226,9 +239,9 @@ interior mutability) rather than living behind one `Mutex`, so a long
       "pos": [80.0, 60.0],
       "blocks": [
         { "id": 1, "type": "when_run" },
-        { "id": 2, "type": "run_motor", "motor": "Single", "direction": "Clockwise", "speed": 50 },
+        { "id": 2, "type": "run_motor", "motor": "Single", "group": "NoCard", "direction": "Clockwise", "speed": 50 },
         { "id": 3, "type": "wait", "seconds": 2.0 },
-        { "id": 4, "type": "stop_motor", "motor": "Single" }
+        { "id": 4, "type": "stop_motor", "motor": "Single", "group": "NoCard" }
       ]
     }
   ]
@@ -236,7 +249,8 @@ interior mutability) rather than living behind one `Mutex`, so a long
 ```
 
 Connections are implied by order within a stack; blocks inside a C-block are
-in its `body` (and `else_body` for If / Else).
+in its `body` (and `else_body` for If / Else). Projects made before card-group
+selection was added omit `group`; those blocks load as `NoCard`.
 
 ## Roadmap
 

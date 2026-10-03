@@ -52,7 +52,7 @@ impl Executor {
         &self,
         program: Program,
         cancel: CancellationToken,
-        events: UnboundedSender<ExecEvent>,
+        events: UnboundedSender<ExecEvent>
     ) -> RunOutcome {
         // "Motor position" counts from 0 at RUN, not from power-on. Best
         // effort: a missing device is reported by the first command using it.
@@ -105,7 +105,7 @@ async fn run_script(
     device: &dyn LegoDevice,
     script: Script,
     cancel: &CancellationToken,
-    events: &UnboundedSender<ExecEvent>,
+    events: &UnboundedSender<ExecEvent>
 ) -> Result<(), ScriptError> {
     let _ = events.send(ExecEvent::BlockStarted(script.hat));
     let _ = events.send(ExecEvent::BlockFinished(script.hat));
@@ -152,23 +152,22 @@ impl Ctx<'_> {
     }
 
     async fn check(&self, condition: &Condition) -> Result<bool, ScriptError> {
-        let value = self.device.read_sensor(condition.query()).await.map_err(ScriptError::Hardware)?;
-        Ok(condition.evaluate(value))
+        let values = self.device.read_sensors(condition.query(), condition.target().group).await.map_err(ScriptError::Hardware)?;
+        Ok(condition.evaluate_any(values))
     }
 
     async fn command(&self, command: &Command) -> Result<(), ScriptError> {
         let hw = |r: Result<(), HardwareError>| r.map_err(ScriptError::Hardware);
         let device = self.device;
         match command {
-            &Command::MotorRun { motor, direction, speed } => hw(device.motor_run(motor, direction, speed).await),
-            &Command::MotorRunForTime { motor, direction, speed, milliseconds } => hw(device
-                .motor_run_for_time(motor, direction, speed, Duration::from_millis(milliseconds))
+            &Command::MotorRun { motor, group, direction, speed } => hw(device.motor_run(motor, group, direction, speed).await),
+            &Command::MotorRunForTime { motor, group, direction, speed, milliseconds } => hw(device
+                .motor_run_for_time(motor, group, direction, speed, Duration::from_millis(milliseconds))
                 .await),
-            &Command::MotorRunForDegrees { motor, direction, speed, degrees } => {
-                hw(device.motor_run_for_degrees(motor, direction, speed, degrees).await)
-            }
-            &Command::MotorStop { motor } => hw(device.motor_stop(motor).await),
-            &Command::MotorResetPosition { motor } => hw(device.motor_reset_position(motor).await),
+            &Command::MotorRunForDegrees { motor, group, direction, speed, degrees } =>
+                hw(device.motor_run_for_degrees(motor, group, direction, speed, degrees).await),
+            &Command::MotorStop { motor, group } => hw(device.motor_stop(motor, group).await),
+            &Command::MotorResetPosition { motor, group } => hw(device.motor_reset_position(motor, group).await),
             &Command::Wait { milliseconds } => self.tick(Duration::from_millis(milliseconds)).await,
             Command::WaitUntil { condition } => {
                 while !self.check(condition).await? {
@@ -201,6 +200,7 @@ impl Ctx<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hardware::CardGroup;
     use crate::hardware::mock::MockDevice;
     use crate::program::compiler::compile;
     use crate::visual::Workspace;
@@ -289,12 +289,12 @@ mod tests {
         let motor = Motor::Single;
         let blocks = vec![
             ws.make_block(BlockKind::WhenRun),
-            ws.make_block(BlockKind::RunMotor { motor, direction: Direction::Clockwise, speed: 10 }),
+            ws.make_block(BlockKind::RunMotor { motor, group: CardGroup::NoCard, direction: Direction::Clockwise, speed: 10 }),
             ws.make_block(BlockKind::WaitUntil {
-                condition: Condition::MotorPosition { motor, cmp: Comparison::Greater, degrees: 90 },
+                condition: Condition::MotorPosition { motor, cmp: Comparison::Greater, degrees: 90, group: CardGroup::NoCard }
             }),
-            ws.make_block(BlockKind::StopMotor { motor }),
-            ws.make_block(BlockKind::ResetPosition { motor }),
+            ws.make_block(BlockKind::StopMotor { motor, group: CardGroup::NoCard }),
+            ws.make_block(BlockKind::ResetPosition { motor, group: CardGroup::NoCard }),
         ];
         ws.add_stack([0.0, 0.0], blocks);
         let program = compile(&ws).unwrap().program;

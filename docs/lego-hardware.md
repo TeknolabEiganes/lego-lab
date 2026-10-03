@@ -162,15 +162,21 @@ Implemented in `src/hardware/lego/`:
   against the byte layouts of the official package.
 * `mod.rs`: `btleplug` (BlueZ over D-Bus on Linux, Tokio based).
   * Scans 4 s, keeps devices advertising FD02 with LEGO manufacturer data.
-    The devices panel lists them all; "Connect" in the toolbar picks the
-    strongest-signal device of each kind.
+    The devices panel lists them all; individual Connect buttons can connect
+    multiple devices of the same kind. **Connect all** in the Devices panel
+    connects every device from the latest scan; with a card-colour filter set,
+    **Connect filtered** connects only devices in that group.
   * Per device: connect, subscribe to notifications, `InfoRequest` (accepts
     RPC 1.0 and 2.0, refuses others with a firmware-update hint), then
     notifications every 50 ms.
   * Requests are matched to replies by `(response id, motor mask)`, FIFO.
     "For time" and "for degrees" resolve when the motor reports it has
     finished.
-  * Sensor conditions read the latest notification values.
+  * Motor commands target all connected devices matching both the motor kind
+    and connection-card colour group. Sensor conditions check latest readings
+    from all matching devices and succeed when any reading matches. Devices
+    without a card belong to the `NoCard` group; card serial numbers are not
+    used for program routing.
   * STOP writes `MotorStop` to every motor device without waiting for replies.
   * Disconnects (from BlueZ events or the notification stream ending) fail
     pending commands, so a running program stops.
