@@ -17,6 +17,7 @@ fn description(kind: &BlockKind) -> &'static str {
         BlockKind::ResetPosition { .. } => "Count the motor's position from 0° again (it also starts at 0° on RUN).",
         BlockKind::MotorForTime { .. } => "Run a motor for some seconds, then stop.",
         BlockKind::MotorRotations { .. } => "Turn a motor a number of rotations, then stop.",
+        BlockKind::Beep { .. } => "Play a short beep on devices in the selected card group.",
         BlockKind::Wait { .. } => "Wait before doing the next block.",
         BlockKind::WaitUntil { .. } => "Wait until a sensor condition is true.",
         BlockKind::Repeat { .. } => "Do the blocks inside a number of times.",
@@ -55,7 +56,7 @@ pub fn show(ui: &mut Ui, ed: &mut Editor, icons: &super::icons::IconTextures) {
             ui.label(egui::RichText::new("BLOCKS").size(16.0).strong());
         });
         ui.add_space(6.0);
-        for cat in [Category::Events, Category::Motors, Category::Control] {
+        for cat in [Category::Events, Category::Motors, Category::Sounds, Category::Control] {
             heading(ui, cat);
             for kind in palette.iter().filter(|k| k.category() == cat) {
                 let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 6.0, 34.0), Sense::click_and_drag());

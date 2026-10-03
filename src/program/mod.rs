@@ -41,6 +41,9 @@ pub enum Command {
         motor: Motor,
         group: CardGroup,
     },
+    Beep {
+        group: CardGroup,
+    },
     Wait {
         milliseconds: u64,
     },

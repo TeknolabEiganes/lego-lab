@@ -132,6 +132,8 @@ pub enum DeviceKind {
 pub enum CardGroup {
     #[default]
     NoCard,
+    /// Selects all card-assigned device groups (does not include NoCard).
+    AllCards,
     Pink,
     Purple,
     Blue,
@@ -145,7 +147,8 @@ pub enum CardGroup {
 }
 
 impl CardGroup {
-    pub const ALL: [CardGroup; 11] = [
+    /// Device groups offered in simulator/device assignment controls.
+    pub const ASSIGNABLE: [CardGroup; 10] = [
         CardGroup::NoCard,
         CardGroup::Pink,
         CardGroup::Purple,
@@ -156,12 +159,27 @@ impl CardGroup {
         CardGroup::Yellow,
         CardGroup::Orange,
         CardGroup::Red,
-        CardGroup::White,
+    ];
+
+    /// Targets offered in program and device-filter selectors.
+    pub const SELECTABLE: [CardGroup; 11] = [
+        CardGroup::NoCard,
+        CardGroup::AllCards,
+        CardGroup::Pink,
+        CardGroup::Purple,
+        CardGroup::Blue,
+        CardGroup::Azure,
+        CardGroup::Turquoise,
+        CardGroup::Green,
+        CardGroup::Yellow,
+        CardGroup::Orange,
+        CardGroup::Red,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             CardGroup::NoCard => "No card",
+            CardGroup::AllCards => "All cards",
             CardGroup::Pink => "Pink card",
             CardGroup::Purple => "Purple card",
             CardGroup::Blue => "Blue card",
@@ -190,6 +208,14 @@ impl CardGroup {
             9 => CardGroup::Red,
             10 => CardGroup::White,
             _ => CardGroup::NoCard,
+        }
+    }
+
+    /// Does this selector match an actual device group?
+    pub fn matches_device_group(self, actual: CardGroup) -> bool {
+        match self {
+            CardGroup::AllCards => actual != CardGroup::NoCard && actual != CardGroup::AllCards,
+            group => group == actual,
         }
     }
 }
@@ -327,6 +353,8 @@ pub enum HardwareError {
     NotConnected,
     #[error("the {} is not connected", .0.label())]
     DeviceMissing(DeviceKind),
+    #[error("no connected device in the {} group", .0.label())]
+    DeviceGroupMissing(CardGroup),
     #[error("communication failed: {0}")]
     Communication(String),
 }
@@ -378,6 +406,9 @@ pub trait LegoDevice: Send + Sync {
 
     /// Set a motor's position count back to 0°.
     async fn motor_reset_position(&self, motor: Motor, group: CardGroup) -> HwResult<()>;
+
+    /// Play the default short beep on every connected device in a card group.
+    async fn beep(&self, group: CardGroup) -> HwResult<()>;
 
     /// Set every connected motor's position count back to 0° (done when a
     /// program starts, so "motor position" means "turned since RUN").
@@ -434,5 +465,9 @@ mod tests {
         assert_eq!(CardGroup::from_firmware(3), CardGroup::Blue);
         assert_eq!(CardGroup::from_firmware(9), CardGroup::Red);
         assert_eq!(CardGroup::from_firmware(99), CardGroup::NoCard);
+        assert!(CardGroup::AllCards.matches_device_group(CardGroup::Blue));
+        assert!(CardGroup::AllCards.matches_device_group(CardGroup::White));
+        assert!(!CardGroup::AllCards.matches_device_group(CardGroup::NoCard));
+        assert!(!CardGroup::SELECTABLE.contains(&CardGroup::White));
     }
 }

@@ -55,10 +55,11 @@ cargo test
 
 ## Using it
 
-1. The app starts in **Bluetooth** mode, scans for LEGO devices and
-   lists them in the devices panel on the right (see *Real LEGO hardware*
-   below). It opens with a starter program:
-   *When Run → Run Motor 50% → Wait 2 s → Stop Motor*.
+1. The app starts in **Bluetooth** mode, scans for LEGO devices and lists them
+   in the Devices pane (see *Real LEGO hardware* below). It reopens the last
+   project you opened or saved; on first launch, or if that file is missing,
+   it starts with an empty canvas. A project path passed on the command line
+   takes precedence.
 2. Connect a device, then press **▶ RUN** (or F5). The running block glows.
    No hardware at hand? Start with `cargo run --release -- --simulator`, or
    pick **Simulator** in the toolbar.
@@ -91,6 +92,7 @@ the same time.
 | --- | --- |
 | Events | When Run |
 | Motors | Run Motor, Stop Motor, Motor for Time, Motor Rotations, Reset Position |
+| Sounds | Beep |
 | Control | Wait, Repeat, Forever, If, If / Else, Wait Until |
 | Sensors | Colour is, Reflection, Button pressed, Motor position, Controller lever |
 
@@ -108,12 +110,16 @@ a *Wait Until* block. You can also change the condition with the dropdowns
 inside the block.
 
 Motor blocks and sensor conditions have a card-group dot at the top right. A
-hollow white dot means **No card**: target all connected devices of that kind
-without a connection card. Click the dot to choose a card colour; a filled dot
-targets all same-kind devices with that card colour. Motors in a selected
-group all receive the command; a sensor condition is true if any matching
-device's latest reading satisfies it. Card colour identifies the device
-group—it is separate from the colour a Colour Sensor detects.
+solid white dot means **No card**: target all connected devices of that kind
+without a connection card. **All cards** targets card-assigned devices of that
+kind regardless of colour; choosing a specific card colour targets only that
+group. Motors in a selected group all receive the command; a sensor condition
+is true if any matching device's latest reading satisfies it. Card colour
+identifies the device group—it is separate from the colour a Colour Sensor
+detects.
+
+The **Beep** sound block plays a short 440 Hz tone on every connected device in
+its selected card group.
 
 ### Example
 

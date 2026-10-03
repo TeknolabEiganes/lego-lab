@@ -166,8 +166,21 @@ impl MockState {
         if self.connection != ConnectionState::Connected {
             return Err(HardwareError::NotConnected);
         }
-        if !self.is_attached(kind) || self.group(kind) != group {
+        if !self.is_attached(kind) || !group.matches_device_group(self.group(kind)) {
             return Err(HardwareError::DeviceMissing(kind));
+        }
+        Ok(())
+    }
+
+    fn check_group(&self, group: CardGroup) -> HwResult<()> {
+        if self.connection != ConnectionState::Connected {
+            return Err(HardwareError::NotConnected);
+        }
+        if !DeviceKind::ALL
+            .into_iter()
+            .any(|kind| self.is_attached(kind) && group.matches_device_group(self.group(kind)))
+        {
+            return Err(HardwareError::DeviceGroupMissing(group));
         }
         Ok(())
     }
@@ -385,6 +398,14 @@ impl LegoDevice for MockDevice {
         })
     }
 
+    async fn beep(&self, group: CardGroup) -> HwResult<()> {
+        self.with_state(|s| {
+            s.check_group(group)?;
+            s.log(format!("Beep on {} group", group.label()));
+            Ok(())
+        })
+    }
+
     async fn reset_motor_positions(&self) -> HwResult<()> {
         self.with_state(|s| {
             if s.connection != ConnectionState::Connected {
@@ -501,5 +522,20 @@ mod tests {
         let values = dev.read_sensors(SensorQuery::Color, CardGroup::Blue).await.unwrap();
         assert_eq!(values, vec![SensorValue::Color(LegoColor::Red)]);
         assert_eq!(dev.read_sensors(SensorQuery::Color, CardGroup::NoCard).await.unwrap_err(), HardwareError::DeviceMissing(DeviceKind::ColorSensor));
+    }
+
+    #[tokio::test]
+    async fn beep_targets_devices_in_its_card_group() {
+        let dev = MockDevice::new();
+        dev.connect().await.unwrap();
+        dev.with_state(|s| {
+            for kind in DeviceKind::ALL {
+                s.set_group(kind, CardGroup::Blue);
+            }
+        });
+
+        assert_eq!(dev.beep(CardGroup::NoCard).await.unwrap_err(), HardwareError::DeviceGroupMissing(CardGroup::NoCard));
+        dev.beep(CardGroup::Blue).await.unwrap();
+        assert!(dev.with_state(|s| s.log.back().unwrap().text.contains("Blue card")));
     }
 }

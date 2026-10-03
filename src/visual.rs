@@ -21,6 +21,7 @@ pub const MAX_DEPTH: usize = 32;
 pub enum Category {
     Events,
     Motors,
+    Sounds,
     Control,
     Sensors,
 }
@@ -62,6 +63,10 @@ pub enum BlockKind {
         speed: i32,
         rotations: f32,
     },
+    Beep {
+        #[serde(default)]
+        group: CardGroup,
+    },
     Wait {
         seconds: f32,
     },
@@ -93,6 +98,7 @@ impl BlockKind {
             BlockKind::MotorForTime { motor, group: CardGroup::NoCard, direction, speed: 50, seconds: 1.0 },
             BlockKind::MotorRotations { motor, group: CardGroup::NoCard, direction, speed: 50, rotations: 1.0 },
             BlockKind::ResetPosition { motor, group: CardGroup::NoCard },
+            BlockKind::Beep { group: CardGroup::NoCard },
             BlockKind::Wait { seconds: 1.0 },
             BlockKind::Repeat { count: 4 },
             BlockKind::Forever,
@@ -110,6 +116,7 @@ impl BlockKind {
             | BlockKind::ResetPosition { .. }
             | BlockKind::MotorForTime { .. }
             | BlockKind::MotorRotations { .. } => Category::Motors,
+            BlockKind::Beep { .. } => Category::Sounds,
             BlockKind::Wait { .. }
             | BlockKind::WaitUntil { .. }
             | BlockKind::Repeat { .. }
@@ -164,6 +171,7 @@ impl BlockKind {
             BlockKind::ResetPosition { .. } => "Reset Position",
             BlockKind::MotorForTime { .. } => "Motor for Time",
             BlockKind::MotorRotations { .. } => "Motor Rotations",
+            BlockKind::Beep { .. } => "Beep",
             BlockKind::Wait { .. } => "Wait",
             BlockKind::WaitUntil { .. } => "Wait Until",
             BlockKind::Repeat { .. } => "Repeat",
@@ -180,6 +188,7 @@ impl BlockKind {
             BlockKind::StopMotor { .. } => "■",
             BlockKind::ResetPosition { .. } => "⟲",
             BlockKind::MotorRotations { .. } => "⟳",
+            BlockKind::Beep { .. } => "♫",
             BlockKind::Wait { .. } | BlockKind::WaitUntil { .. } => "⏱",
             BlockKind::Repeat { .. } | BlockKind::Forever => "🔁",
             BlockKind::If { .. } | BlockKind::IfElse { .. } => "❓",
@@ -196,6 +205,7 @@ impl BlockKind {
             BlockKind::WhenRun
             | BlockKind::StopMotor { .. }
             | BlockKind::ResetPosition { .. }
+            | BlockKind::Beep { .. }
             | BlockKind::Forever => {}
             BlockKind::RunMotor { speed, .. } => *speed = (*speed).clamp(0, 100),
             BlockKind::MotorForTime { speed, seconds, .. } => {
@@ -303,6 +313,7 @@ impl Workspace {
     }
 
     /// The starter program from the plan: run, wait, stop.
+    #[cfg(test)]
     pub fn example() -> Self {
         let mut ws = Self::new();
         let motor = Motor::Single;

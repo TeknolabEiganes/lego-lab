@@ -1,7 +1,7 @@
 //! Application state and the glue between UI, executor and hardware.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,31 @@ use crate::ui::{icons::IconTextures, palette, theme};
 use crate::visual::{BlockId, Workspace};
 
 const HIGHLIGHT_LINGER: Duration = Duration::from_millis(180);
+const LAST_PROJECT_FILE: &str = "last-project";
+
+fn app_config_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .map(|base| base.join("lego-lab"))
+}
+
+fn read_last_project_path() -> Option<PathBuf> {
+    let config = app_config_dir()?;
+    let path = std::fs::read_to_string(config.join(LAST_PROJECT_FILE)).ok()?;
+    let path = PathBuf::from(path.trim());
+    (!path.as_os_str().is_empty()).then_some(path)
+}
+
+fn remember_last_project(path: &Path) {
+    let Some(config) = app_config_dir() else { return };
+    if std::fs::create_dir_all(&config).is_err() {
+        return;
+    }
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let _ = std::fs::write(config.join(LAST_PROJECT_FILE), path.to_string_lossy().as_bytes());
+}
 
 /// Results of background hardware work, delivered to the UI thread.
 enum HwMsg {
@@ -83,7 +108,7 @@ impl LegoLabApp {
             ble: LegoBleDevice::new(),
             backend: Backend::Simulator,
             icons,
-            editor: Editor::new(Workspace::example()),
+            editor: Editor::new(Workspace::new()),
             project_name: "My Robot".into(),
             path: None,
             dirty: false,
@@ -100,8 +125,13 @@ impl LegoLabApp {
             show_right_panel: true,
             device_filter: None,
         };
-        if let Some(path) = open_path {
-            app.open_path(path);
+        let explicit_path = open_path.is_some();
+        if let Some(path) = open_path.or_else(read_last_project_path) {
+            if explicit_path || path.exists() {
+                app.open_path(path);
+            } else {
+                app.info("Last project file was not found; started with an empty canvas.");
+            }
         }
         if bluetooth {
             app.select_backend(Backend::Bluetooth, &cc.egui_ctx);
@@ -303,7 +333,7 @@ impl LegoLabApp {
                 !self
                     .devices
                     .iter()
-                    .any(|d| d.kind == target.kind && d.group == target.group)
+                    .any(|d| d.kind == target.kind && target.group.matches_device_group(d.group))
             })
         {
             self.error(format!(
@@ -311,6 +341,14 @@ impl LegoLabApp {
                 missing.kind.label(),
                 missing.group.label()
             ));
+            return;
+        }
+        if let Some(group) = compiled
+            .groups
+            .iter()
+            .find(|group| !self.devices.iter().any(|d| group.matches_device_group(d.group)))
+        {
+            self.error(format!("Your program beeps the {} group, but no device in that group is connected.", group.label()));
             return;
         }
 
@@ -413,6 +451,7 @@ impl LegoLabApp {
                 self.editor = Editor::new(p.workspace);
                 self.project_name = p.name;
                 self.info(format!("Opened {}", path.display()));
+                remember_last_project(&path);
                 self.path = Some(path);
                 self.dirty = false;
                 self.error_block = None;
@@ -441,6 +480,7 @@ impl LegoLabApp {
         match project.save(&path) {
             Ok(()) => {
                 self.info(format!("Saved {}", path.display()));
+                remember_last_project(&path);
                 self.path = Some(path);
                 self.dirty = false;
             }

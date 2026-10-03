@@ -15,6 +15,9 @@ pub const INFO_RESPONSE: u8 = 1;
 pub const DEVICE_NOTIFICATION_REQUEST: u8 = 40;
 pub const DEVICE_NOTIFICATION_RESPONSE: u8 = 41;
 pub const DEVICE_NOTIFICATION: u8 = 60;
+pub const PLAY_BEEP: u8 = 112;
+pub const PLAY_BEEP_RESULT: u8 = 113;
+pub const SOUND_PATTERN_BEEP_SINGLE: u8 = 0;
 pub const MOTOR_RESET_RELATIVE_POSITION: u8 = 120;
 pub const MOTOR_RESET_RELATIVE_POSITION_RESULT: u8 = 121;
 pub const MOTOR_RUN: u8 = 122;
@@ -105,6 +108,14 @@ pub fn motor_reset_relative_position(mask: u8, position: i32) -> Vec<u8> {
 
 pub fn motor_stop(mask: u8) -> Vec<u8> {
     vec![MOTOR_STOP, mask]
+}
+
+/// Play one default single beep at 440 Hz.
+pub fn play_beep() -> Vec<u8> {
+    let mut message = vec![PLAY_BEEP, SOUND_PATTERN_BEEP_SINGLE];
+    message.extend_from_slice(&440u16.to_le_bytes());
+    message.push(1);
+    message
 }
 
 // ---- responses ------------------------------------------------------------
@@ -336,6 +347,7 @@ mod tests {
         assert_eq!(motor_run_for_degrees(3, -360, Direction::Clockwise), [124, 3, 0x98, 0xfe, 0xff, 0xff, 0]);
         assert_eq!(motor_stop(3), [138, 3]);
         assert_eq!(motor_reset_relative_position(3, 0), [120, 3, 0, 0, 0, 0]);
+        assert_eq!(play_beep(), [112, SOUND_PATTERN_BEEP_SINGLE, 0xb8, 0x01, 1]);
         assert_eq!(device_notification_request(50), [40, 50, 0]);
         assert_eq!(device_notification_request(5), [40, 15, 0], "clamped to the minimum");
         assert_eq!(motor_mask(Motor::DoubleRight), 2);

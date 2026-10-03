@@ -168,6 +168,7 @@ impl Ctx<'_> {
                 hw(device.motor_run_for_degrees(motor, group, direction, speed, degrees).await),
             &Command::MotorStop { motor, group } => hw(device.motor_stop(motor, group).await),
             &Command::MotorResetPosition { motor, group } => hw(device.motor_reset_position(motor, group).await),
+            &Command::Beep { group } => hw(device.beep(group).await),
             &Command::Wait { milliseconds } => self.tick(Duration::from_millis(milliseconds)).await,
             Command::WaitUntil { condition } => {
                 while !self.check(condition).await? {

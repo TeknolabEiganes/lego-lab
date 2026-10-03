@@ -132,7 +132,7 @@ fn device_header(ui: &mut Ui, s: &mut MockState, kind: DeviceKind) -> bool {
             .selected_text(group.label())
             .width(125.0)
             .show_ui(ui, |ui| {
-                for option in CardGroup::ALL {
+                for option in CardGroup::ASSIGNABLE {
                     ui.selectable_value(&mut group, option, option.label());
                 }
             });
@@ -292,7 +292,7 @@ pub fn hardware_panel(ui: &mut Ui, view: HardwareView, icons: &IconTextures) -> 
             .find(|live| live.address == d.address)
             .map_or(d.group, |live| live.group)
     };
-    let has_matching_found = view.found.iter().any(|d| view.filter.is_none_or(|g| found_group(d) == g));
+    let has_matching_found = view.found.iter().any(|d| view.filter.is_none_or(|g| g.matches_device_group(found_group(d))));
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
@@ -324,10 +324,10 @@ pub fn hardware_panel(ui: &mut Ui, view: HardwareView, icons: &IconTextures) -> 
     let mut filter = view.filter;
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
         egui::ComboBox::from_id_salt("device_card_filter")
-            .selected_text(filter.map_or_else(|| "All colours".to_string(), |g| g.label().to_string()))
+            .selected_text(filter.map_or_else(|| "All".to_string(), |g| g.label().to_string()))
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut filter, None, "All colours");
-                for group in CardGroup::ALL {
+                ui.selectable_value(&mut filter, None, "All");
+                for group in CardGroup::ASSIGNABLE {
                     ui.selectable_value(&mut filter, Some(group), group.label());
                 }
             });
@@ -351,7 +351,7 @@ pub fn hardware_panel(ui: &mut Ui, view: HardwareView, icons: &IconTextures) -> 
                 ui.label(RichText::new(format!("No devices match the {} filter.", group.label())).color(theme::TEXT_MUTED));
             }
         }
-        for d in view.found.iter().filter(|d| view.filter.is_none_or(|g| found_group(d) == g)) {
+        for d in view.found.iter().filter(|d| view.filter.is_none_or(|g| g.matches_device_group(found_group(d)))) {
             let connected = view.connected.contains(&d.address);
             let live = view.live.iter().find(|l| l.address == d.address);
             // A card scanned while connected is newer than the scan result.
@@ -393,7 +393,7 @@ pub fn hardware_panel(ui: &mut Ui, view: HardwareView, icons: &IconTextures) -> 
         }
         // Connected devices that aren't in the scan list (e.g. after a re-scan).
         for live in view.live.iter().filter(|l| {
-            view.filter.is_none_or(|g| l.group == g) && !view.found.iter().any(|f| f.address == l.address)
+            view.filter.is_none_or(|g| g.matches_device_group(l.group)) && !view.found.iter().any(|f| f.address == l.address)
         }) {
             card(ui, |ui| {
                 ui.label(RichText::new(live.kind.label()).size(15.0).strong());

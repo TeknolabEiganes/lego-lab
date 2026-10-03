@@ -88,7 +88,7 @@ fn rows(kind: &BlockKind) -> Vec<Row> {
     let motor = vec![(Motor, 200.0)];
     let dir_speed = vec![(Direction, 136.0), (Text("speed"), 44.0), (Speed, 58.0)];
     match kind {
-        BlockKind::WhenRun | BlockKind::Forever => vec![],
+        BlockKind::WhenRun | BlockKind::Forever | BlockKind::Beep { .. } => vec![],
         BlockKind::RunMotor { .. } => vec![motor, dir_speed],
         BlockKind::StopMotor { .. } | BlockKind::ResetPosition { .. } => vec![motor],
         BlockKind::MotorForTime { .. } => {
@@ -185,7 +185,8 @@ fn card_group_mut(kind: &mut BlockKind) -> Option<&mut CardGroup> {
         | BlockKind::StopMotor { group, .. }
         | BlockKind::ResetPosition { group, .. }
         | BlockKind::MotorForTime { group, .. }
-        | BlockKind::MotorRotations { group, .. } => Some(group),
+        | BlockKind::MotorRotations { group, .. }
+        | BlockKind::Beep { group } => Some(group),
         BlockKind::WaitUntil { condition } | BlockKind::If { condition } | BlockKind::IfElse { condition } => {
             Some(condition_group_mut(condition))
         }
@@ -202,7 +203,8 @@ fn card_group(kind: &BlockKind) -> Option<CardGroup> {
             | BlockKind::StopMotor { group, .. }
             | BlockKind::ResetPosition { group, .. }
             | BlockKind::MotorForTime { group, .. }
-            | BlockKind::MotorRotations { group, .. } => Some(*group),
+            | BlockKind::MotorRotations { group, .. }
+            | BlockKind::Beep { group } => Some(*group),
             _ => None,
         }
     }
@@ -210,7 +212,8 @@ fn card_group(kind: &BlockKind) -> Option<CardGroup> {
 
 fn card_group_rgb(group: CardGroup) -> Option<[u8; 3]> {
     match group {
-        CardGroup::NoCard => None,
+        CardGroup::AllCards => None,
+        CardGroup::NoCard => Some([0xf4, 0xf4, 0xf4]),
         CardGroup::Pink => Some([0xff, 0x69, 0xb4]),
         CardGroup::Purple => Some([0x74, 0x46, 0x99]),
         CardGroup::Blue => Some([0x00, 0x6c, 0xb8]),
@@ -228,9 +231,23 @@ fn paint_card_group_dot(painter: &Painter, rect: Rect, group: CardGroup, hovered
     let center = rect.center();
     let radius = rect.width().min(rect.height()) * 0.38;
     let stroke = if hovered { theme::HIGHLIGHT } else { Color32::WHITE };
+    if group == CardGroup::AllCards {
+        painter.circle_filled(center, radius, Color32::WHITE);
+        painter.circle_stroke(center, radius, Stroke::new(1.5, theme::TEXT_MUTED));
+        let dot_radius = radius * 0.28;
+        for (offset, color) in [
+            (vec2(-0.38, -0.38), Color32::from_rgb(0xde, 0x1a, 0x21)),
+            (vec2(0.38, -0.38), Color32::from_rgb(0x00, 0x6c, 0xb8)),
+            (vec2(-0.38, 0.38), Color32::from_rgb(0x61, 0xa8, 0x36)),
+            (vec2(0.38, 0.38), Color32::from_rgb(0xff, 0xd4, 0x00)),
+        ] {
+            painter.circle_filled(center + offset * radius, dot_radius, color);
+        }
+        return;
+    }
     if let Some([r, g, b]) = card_group_rgb(group) {
         painter.circle_filled(center, radius, Color32::from_rgb(r, g, b));
-        let border = if group == CardGroup::White { theme::TEXT } else { stroke };
+        let border = if matches!(group, CardGroup::NoCard | CardGroup::White) { theme::TEXT } else { stroke };
         painter.circle_stroke(center, radius, Stroke::new(1.5, border));
     } else {
         // An unassigned device is an empty white circle, not a wildcard.
@@ -250,7 +267,7 @@ fn card_group_widget(ui: &mut Ui, header: Rect, id: u64, kind: &mut BlockKind) -
     }
     egui::Popup::menu(&response).show(|ui| {
         ui.set_min_width(130.0);
-        for option in CardGroup::ALL {
+        for option in CardGroup::SELECTABLE {
             ui.horizontal(|ui| {
                 let (dot, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
                 paint_card_group_dot(ui.painter(), dot, option, false);

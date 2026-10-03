@@ -176,6 +176,15 @@ impl Link {
             _ => Ok(()),
         }
     }
+
+    async fn sound_command(&self, data: &[u8], result_id: u8) -> HwResult<()> {
+        let reply = self.request(data, (result_id, None), REPLY_TIMEOUT).await?;
+        if protocol::parse_status(&reply) == Some(CommandStatus::Refused) {
+            Err(comm(format!("the {} refused the sound command", self.kind.label())))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 async fn adapter() -> HwResult<Adapter> {
@@ -393,7 +402,11 @@ impl LegoBleDevice {
         if self.connection() != ConnectionState::Connected {
             return Err(HardwareError::NotConnected);
         }
-        let links: Vec<_> = self.links().into_iter().filter(|l| l.kind == kind && l.group() == group).collect();
+        let links: Vec<_> = self
+            .links()
+            .into_iter()
+            .filter(|l| l.kind == kind && group.matches_device_group(l.group()))
+            .collect();
         if links.is_empty() { Err(HardwareError::DeviceMissing(kind)) } else { Ok(links) }
     }
 
@@ -470,7 +483,7 @@ impl LegoBleDevice {
         let found: Vec<_> = self
             .last_scan()
             .into_iter()
-            .filter(|device| group.is_none_or(|group| device.group == group))
+            .filter(|device| group.is_none_or(|group| group.matches_device_group(device.group)))
             .collect();
         if found.is_empty() {
             let message = group.map_or_else(
@@ -716,6 +729,27 @@ impl LegoDevice for LegoBleDevice {
         }))
         .await;
         results.into_iter().find(|r| r.is_err()).unwrap_or(Ok(()))
+    }
+
+    async fn beep(&self, group: CardGroup) -> HwResult<()> {
+        if self.connection() != ConnectionState::Connected {
+            return Err(HardwareError::NotConnected);
+        }
+        let links: Vec<_> = self
+            .links()
+            .into_iter()
+            .filter(|link| group.matches_device_group(link.group()))
+            .collect();
+        if links.is_empty() {
+            return Err(HardwareError::DeviceGroupMissing(group));
+        }
+        let command = protocol::play_beep();
+        let results = futures::future::join_all(links.into_iter().map(|link| {
+            let command = command.clone();
+            async move { link.sound_command(&command, protocol::PLAY_BEEP_RESULT).await }
+        }))
+        .await;
+        results.into_iter().find(|result| result.is_err()).unwrap_or(Ok(()))
     }
 
     async fn reset_motor_positions(&self) -> HwResult<()> {

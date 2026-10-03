@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::hardware::{DeviceTarget, Speed};
+use crate::hardware::{CardGroup, DeviceTarget, Speed};
 use crate::visual::{Block, BlockId, BlockKind, MAX_ROTATIONS, MAX_SECONDS, Workspace};
 
 use super::{Command, Program, Script, Step};
@@ -19,6 +19,8 @@ pub struct Compiled {
     pub program: Program,
     /// Devices the program needs, so the app can check they are connected.
     pub devices: BTreeSet<DeviceTarget>,
+    /// Card groups needed by commands that operate on any device kind.
+    pub groups: BTreeSet<CardGroup>,
 }
 
 fn seconds_to_ms(seconds: f32) -> u64 {
@@ -28,6 +30,7 @@ fn seconds_to_ms(seconds: f32) -> u64 {
 struct Compiler {
     errors: Vec<CompileError>,
     devices: BTreeSet<DeviceTarget>,
+    groups: BTreeSet<CardGroup>,
 }
 
 impl Compiler {
@@ -83,6 +86,7 @@ impl Compiler {
                     degrees,
                 }
             }
+            BlockKind::Beep { group } => Command::Beep { group },
             BlockKind::Wait { seconds } => Command::Wait { milliseconds: seconds_to_ms(seconds) },
             BlockKind::WaitUntil { condition } => Command::WaitUntil { condition },
             BlockKind::Repeat { count } => Command::Repeat { count, body: self.seq(&block.body) },
@@ -104,6 +108,9 @@ impl Compiler {
         if let Some(target) = motor_target(&command) {
             self.devices.insert(target);
         }
+        if let Command::Beep { group } = &command {
+            self.groups.insert(*group);
+        }
         Some(command)
     }
 }
@@ -122,7 +129,7 @@ fn motor_target(command: &Command) -> Option<DeviceTarget> {
 }
 
 pub fn compile(ws: &Workspace) -> Result<Compiled, Vec<CompileError>> {
-    let mut c = Compiler { errors: Vec::new(), devices: BTreeSet::new() };
+    let mut c = Compiler { errors: Vec::new(), devices: BTreeSet::new(), groups: BTreeSet::new() };
     let mut program = Program::default();
 
     for stack in &ws.stacks {
@@ -143,7 +150,7 @@ pub fn compile(ws: &Workspace) -> Result<Compiled, Vec<CompileError>> {
     }
 
     if c.errors.is_empty() {
-        Ok(Compiled { program, devices: c.devices })
+        Ok(Compiled { program, devices: c.devices, groups: c.groups })
     } else {
         Err(c.errors)
     }
@@ -217,6 +224,17 @@ mod tests {
 
         let compiled = compile(&ws).unwrap();
         assert!(compiled.devices.contains(&DeviceTarget { kind: DeviceKind::ColorSensor, group: CardGroup::Blue }));
+    }
+
+    #[test]
+    fn beep_requires_a_device_in_its_card_group() {
+        let mut ws = Workspace::new();
+        let hat = ws.make_block(BlockKind::WhenRun);
+        let beep = ws.make_block(BlockKind::Beep { group: CardGroup::Blue });
+        ws.add_stack([0.0, 0.0], vec![hat, beep]);
+
+        let compiled = compile(&ws).unwrap();
+        assert!(compiled.groups.contains(&CardGroup::Blue));
     }
 
     #[test]

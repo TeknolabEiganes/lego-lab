@@ -41,6 +41,12 @@ pub fn category(cat: Category) -> CategoryStyle {
             dark: Color32::from_rgb(0x25, 0x5F, 0xC9),
             text: Color32::WHITE,
         },
+        Category::Sounds => CategoryStyle {
+            name: "SOUNDS",
+            fill: Color32::from_rgb(0x8B, 0x5C, 0xF6),
+            dark: Color32::from_rgb(0x6D, 0x28, 0xD9),
+            text: Color32::WHITE,
+        },
         Category::Control => CategoryStyle {
             name: "CONTROL",
             fill: Color32::from_rgb(0xF9, 0x73, 0x16),
