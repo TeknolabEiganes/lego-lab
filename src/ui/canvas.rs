@@ -84,6 +84,8 @@ impl Editor {
 pub struct CanvasInfo<'a> {
     pub active: &'a HashSet<BlockId>,
     pub error_block: Option<BlockId>,
+    /// Names of the project's trained camera poses.
+    pub poses: &'a [String],
 }
 
 // ---- layout -------------------------------------------------------------
@@ -181,14 +183,14 @@ fn find_target(ws: &Workspace, snaps: &[Snap], chain: &[Block], ghost: Pos2) -> 
 }
 
 /// Paint a free-floating chain (drag ghost).
-fn paint_chain(painter: &egui::Painter, top_left: Pos2, blocks: &[Block], fade: f32) {
+fn paint_chain(painter: &egui::Painter, top_left: Pos2, blocks: &[Block], fade: f32, poses: &[String]) {
     let mut ws = Workspace::new();
     ws.add_stack([top_left.x, top_left.y], blocks.to_vec());
     let lay = layout(&ws, None);
     let look = Look { static_fields: true, fade, ..Look::normal() };
     for l in &lay.blocks {
         if let Some(b) = ws.block(&l.path) {
-            block::paint_block(painter, l.rect, &l.slots, &b.kind, look);
+            block::paint_block(painter, l.rect, &l.slots, &b.kind, look, poses);
         }
     }
     for l in &lay.blocks {
@@ -282,12 +284,12 @@ enum Target {
     Free,
 }
 
-fn paint_drag_payload(painter: &egui::Painter, payload: &Payload, pos: Pos2, fade: f32) {
+fn paint_drag_payload(painter: &egui::Painter, payload: &Payload, pos: Pos2, fade: f32, poses: &[String]) {
     match payload {
-        Payload::Blocks(chain) => paint_chain(painter, pos, chain, fade),
+        Payload::Blocks(chain) => paint_chain(painter, pos, chain, fade, poses),
         Payload::Condition(condition) => {
             let rect = Rect::from_min_size(pos, CONDITION_GHOST);
-            block::paint_condition_chip(painter, rect, &condition.describe(), false, fade);
+            block::paint_condition_chip(painter, rect, &condition.describe(poses), false, fade);
         }
     }
 }
@@ -378,9 +380,9 @@ pub fn show(ui: &mut Ui, ed: &mut Editor, info: &CanvasInfo) -> bool {
             drop_condition: drop_condition.as_ref() == Some(&laid.path),
             ..Look::normal()
         };
-        block::paint_block(cui.painter(), laid.rect, &laid.slots, &block.kind, look);
+        block::paint_block(cui.painter(), laid.rect, &laid.slots, &block.kind, look, info.poses);
         let header = Rect::from_min_size(laid.rect.min, vec2(BLOCK_W, header_height(&block.kind)));
-        if block::field_widgets(&mut cui, header, id, &mut block.kind) {
+        if block::field_widgets(&mut cui, header, id, &mut block.kind, info.poses) {
             changed = true;
         }
         if resp.drag_started_by(PointerButton::Primary) {
@@ -418,13 +420,13 @@ pub fn show(ui: &mut Ui, ed: &mut Editor, info: &CanvasInfo) -> bool {
         if rect.contains(p) {
             // Draw in the canvas's already-transformed layer. This keeps the
             // drag preview aligned with the blocks at every zoom level.
-            paint_drag_payload(&cui.painter(), &drag.payload, pos, 1.0);
+            paint_drag_payload(&cui.painter(), &drag.payload, pos, 1.0, info.poses);
         } else {
             let ghost_layer = LayerId::new(Order::Tooltip, Id::new("drag_ghost"));
             ctx.set_transform_layer(ghost_layer, transform);
             let gp = ctx.layer_painter(ghost_layer);
             let fade = if ed.palette_rect.contains(p) { 0.45 } else { 0.95 };
-            paint_drag_payload(&gp, &drag.payload, pos, fade);
+            paint_drag_payload(&gp, &drag.payload, pos, fade, info.poses);
         }
     }
 

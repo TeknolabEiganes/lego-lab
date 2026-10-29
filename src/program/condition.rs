@@ -1,10 +1,12 @@
 //! Sensor conditions used by If, If/Else and Wait Until.
 //!
 //! Only conditions the Computer Science & AI hardware can actually measure
-//! (see docs/lego-hardware.md).
+//! (see docs/lego-hardware.md), plus the computer's camera.
 
 use serde::{Deserialize, Serialize};
 
+use crate::camera::body::{MAX_DISTANCE, MAX_POSITION};
+use crate::camera::{Axis, BodyPoint, CameraPose, Detection};
 use crate::hardware::{CardGroup, DeviceKind, DeviceTarget, LegoColor, Lever, Motor, SensorQuery, SensorValue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -67,6 +69,36 @@ pub enum Condition {
         #[serde(default)]
         group: CardGroup,
     },
+    /// The computer's camera sees a person or a pose.
+    Camera {
+        pose: CameraPose,
+    },
+    /// Two body points touch (camera).
+    BodyTouching {
+        one: BodyPoint,
+        two: BodyPoint,
+    },
+    /// Distance between two body points (camera), in Coding Canvas units.
+    BodyDistance {
+        one: BodyPoint,
+        two: BodyPoint,
+        cmp: Comparison,
+        distance: i32,
+    },
+    /// Direction from one body point to another (camera), 0–359°.
+    BodyAngle {
+        one: BodyPoint,
+        two: BodyPoint,
+        cmp: Comparison,
+        degrees: i32,
+    },
+    /// Where a body point is in the picture (camera).
+    BodyPosition {
+        axis: Axis,
+        point: BodyPoint,
+        cmp: Comparison,
+        value: i32,
+    },
 }
 
 /// The kinds of condition, for the sensor picker.
@@ -77,16 +109,38 @@ pub enum ConditionKind {
     Button,
     MotorPosition,
     Lever,
+    Camera,
+    BodyTouching,
+    BodyDistance,
+    BodyAngle,
+    BodyPosition,
 }
 
 impl ConditionKind {
-    pub const ALL: [ConditionKind; 5] = [
+    pub const ALL: [ConditionKind; 10] = [
         ConditionKind::Color,
         ConditionKind::Reflection,
         ConditionKind::Button,
         ConditionKind::MotorPosition,
         ConditionKind::Lever,
+        ConditionKind::Camera,
+        ConditionKind::BodyTouching,
+        ConditionKind::BodyDistance,
+        ConditionKind::BodyAngle,
+        ConditionKind::BodyPosition,
     ];
+
+    /// Read from the computer's camera rather than a LEGO device.
+    pub fn is_camera(self) -> bool {
+        matches!(
+            self,
+            ConditionKind::Camera
+                | ConditionKind::BodyTouching
+                | ConditionKind::BodyDistance
+                | ConditionKind::BodyAngle
+                | ConditionKind::BodyPosition
+        )
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -95,6 +149,11 @@ impl ConditionKind {
             ConditionKind::Button => "Button pressed",
             ConditionKind::MotorPosition => "Motor position",
             ConditionKind::Lever => "Controller lever",
+            ConditionKind::Camera => "Camera sees",
+            ConditionKind::BodyTouching => "Body points touch",
+            ConditionKind::BodyDistance => "Body distance",
+            ConditionKind::BodyAngle => "Body angle",
+            ConditionKind::BodyPosition => "Body position",
         }
     }
 
@@ -125,6 +184,26 @@ impl ConditionKind {
                 percent: 50,
                 group: CardGroup::NoCard,
             },
+            ConditionKind::Camera => Condition::Camera { pose: CameraPose::Person },
+            ConditionKind::BodyTouching => Condition::BodyTouching { one: BodyPoint::LeftWrist, two: BodyPoint::RightWrist },
+            ConditionKind::BodyDistance => Condition::BodyDistance {
+                one: BodyPoint::LeftWrist,
+                two: BodyPoint::RightWrist,
+                cmp: Comparison::Greater,
+                distance: 50,
+            },
+            ConditionKind::BodyAngle => Condition::BodyAngle {
+                one: BodyPoint::LeftShoulder,
+                two: BodyPoint::RightShoulder,
+                cmp: Comparison::Greater,
+                degrees: 20,
+            },
+            ConditionKind::BodyPosition => Condition::BodyPosition {
+                axis: Axis::X,
+                point: BodyPoint::Nose,
+                cmp: Comparison::Greater,
+                value: 0,
+            },
         }
     }
 }
@@ -145,38 +224,84 @@ impl Condition {
             Condition::ButtonPressed { .. } => ConditionKind::Button,
             Condition::MotorPosition { .. } => ConditionKind::MotorPosition,
             Condition::LeverPosition { .. } => ConditionKind::Lever,
+            Condition::Camera { .. } => ConditionKind::Camera,
+            Condition::BodyTouching { .. } => ConditionKind::BodyTouching,
+            Condition::BodyDistance { .. } => ConditionKind::BodyDistance,
+            Condition::BodyAngle { .. } => ConditionKind::BodyAngle,
+            Condition::BodyPosition { .. } => ConditionKind::BodyPosition,
         }
     }
 
-    /// The device that has to be connected to evaluate this condition.
-    pub fn device(&self) -> DeviceKind {
+    /// Read from the computer's camera rather than a LEGO device.
+    pub fn is_camera(&self) -> bool {
+        self.kind().is_camera()
+    }
+
+    /// Evaluate a camera condition against what the camera sees.
+    pub fn evaluate_camera(&self, seen: &Detection) -> bool {
+        let pose = seen.pose.as_ref();
+        let test = |value: Option<f32>, cmp: Comparison, threshold: i32| {
+            value.is_some_and(|v| cmp.test(v.floor() as i64, threshold as i64))
+        };
+        match *self {
+            Condition::Camera { pose } => seen.matches(pose),
+            Condition::BodyTouching { one, two } => pose.is_some_and(|p| p.touching(one, two)),
+            Condition::BodyDistance { one, two, cmp, distance } => test(pose.and_then(|p| p.distance(one, two)), cmp, distance),
+            Condition::BodyAngle { one, two, cmp, degrees } => test(pose.and_then(|p| p.angle(one, two)), cmp, degrees),
+            Condition::BodyPosition { axis, point, cmp, value } => test(pose.and_then(|p| p.coordinate(axis, point)), cmp, value),
+            _ => false,
+        }
+    }
+
+    /// The LEGO device that has to be connected to evaluate this condition
+    /// (none for the camera).
+    pub fn device(&self) -> Option<DeviceKind> {
         match self {
-            Condition::ColorIs { .. } | Condition::Reflection { .. } => DeviceKind::ColorSensor,
-            Condition::ButtonPressed { device, .. } => *device,
-            Condition::MotorPosition { motor, .. } => motor.device(),
-            Condition::LeverPosition { .. } => DeviceKind::Controller,
+            Condition::ColorIs { .. } | Condition::Reflection { .. } => Some(DeviceKind::ColorSensor),
+            Condition::ButtonPressed { device, .. } => Some(*device),
+            Condition::MotorPosition { motor, .. } => Some(motor.device()),
+            Condition::LeverPosition { .. } => Some(DeviceKind::Controller),
+            _ => None,
         }
     }
 
-    pub fn target(&self) -> DeviceTarget {
-        let group = match *self {
+    /// The card group whose devices this condition reads.
+    pub fn group(&self) -> Option<CardGroup> {
+        match *self {
             Condition::ColorIs { group, .. }
             | Condition::Reflection { group, .. }
             | Condition::ButtonPressed { group, .. }
             | Condition::MotorPosition { group, .. }
-            | Condition::LeverPosition { group, .. } => group,
-        };
-        DeviceTarget { kind: self.device(), group }
+            | Condition::LeverPosition { group, .. } => Some(group),
+            _ => None,
+        }
     }
 
-    pub fn query(&self) -> SensorQuery {
-        match *self {
+    pub fn group_mut(&mut self) -> Option<&mut CardGroup> {
+        match self {
+            Condition::ColorIs { group, .. }
+            | Condition::Reflection { group, .. }
+            | Condition::ButtonPressed { group, .. }
+            | Condition::MotorPosition { group, .. }
+            | Condition::LeverPosition { group, .. } => Some(group),
+            _ => None,
+        }
+    }
+
+    pub fn target(&self) -> Option<DeviceTarget> {
+        Some(DeviceTarget { kind: self.device()?, group: self.group()? })
+    }
+
+    /// What to ask the LEGO devices (none for the camera).
+    pub fn query(&self) -> Option<SensorQuery> {
+        Some(match *self {
             Condition::ColorIs { .. } => SensorQuery::Color,
             Condition::Reflection { .. } => SensorQuery::Reflection,
             Condition::ButtonPressed { device, .. } => SensorQuery::Button(device),
             Condition::MotorPosition { motor, .. } => SensorQuery::MotorPosition(motor),
             Condition::LeverPosition { lever, .. } => SensorQuery::ControllerLever(lever),
-        }
+            _ => return None,
+        })
     }
 
     /// Evaluate against a sensor reading. A reading of the wrong type is false.
@@ -212,12 +337,17 @@ impl Condition {
                 }
                 *degrees = (*degrees).clamp(-MAX_DEGREES, MAX_DEGREES);
             }
-            Condition::ColorIs { .. } | Condition::ButtonPressed { .. } => {}
+            Condition::Camera { pose } => pose.sanitize(),
+            Condition::BodyDistance { distance, .. } => *distance = (*distance).clamp(0, MAX_DISTANCE),
+            Condition::BodyAngle { degrees, .. } => *degrees = (*degrees).clamp(0, 359),
+            Condition::BodyPosition { value, .. } => *value = (*value).clamp(-MAX_POSITION, MAX_POSITION),
+            Condition::ColorIs { .. } | Condition::ButtonPressed { .. } | Condition::BodyTouching { .. } => {}
         }
     }
 
-    /// Short text, e.g. for palette chips and ghosts.
-    pub fn describe(&self) -> String {
+    /// Short text, e.g. for palette chips and ghosts. `poses` names the
+    /// project's trained camera poses.
+    pub fn describe(&self, poses: &[String]) -> String {
         match self {
             Condition::ColorIs { color, .. } => format!("colour is {}", color.label()),
             Condition::Reflection { cmp, percent, .. } => format!("reflection {} {percent}%", cmp.symbol()),
@@ -227,6 +357,17 @@ impl Condition {
             }
             Condition::LeverPosition { lever, cmp, percent, .. } => {
                 format!("{} lever {} {percent}%", lever.label(), cmp.symbol())
+            }
+            Condition::Camera { pose } => format!("camera sees {}", pose.label(poses)),
+            Condition::BodyTouching { one, two } => format!("{} touches {}", one.label(), two.label()),
+            Condition::BodyDistance { one, two, cmp, distance } => {
+                format!("distance {}–{} {} {distance}", one.label(), two.label(), cmp.symbol())
+            }
+            Condition::BodyAngle { one, two, cmp, degrees } => {
+                format!("angle {}→{} {} {degrees}°", one.label(), two.label(), cmp.symbol())
+            }
+            Condition::BodyPosition { axis, point, cmp, value } => {
+                format!("{} {} {} {value}", point.label(), axis.label(), cmp.symbol())
             }
         }
     }
@@ -264,6 +405,44 @@ mod tests {
             SensorValue::Color(LegoColor::Blue),
             SensorValue::Color(LegoColor::Yellow)
         ]));
+    }
+
+    #[test]
+    fn camera_conditions_load_and_need_no_device() {
+        let custom: Condition = serde_json::from_str(r#"{"sensor":"camera","pose":{"Custom":99}}"#).unwrap();
+        let mut custom = custom;
+        custom.sanitize();
+        assert_eq!(custom, Condition::Camera { pose: CameraPose::Custom(7) });
+        let arms: Condition = serde_json::from_str(r#"{"sensor":"camera","pose":"LeftArmUp"}"#).unwrap();
+        assert_eq!(arms.target(), None);
+        assert_eq!(arms.query(), None);
+        assert_eq!(arms.describe(&[]), "camera sees left arm up");
+        assert_eq!(Condition::Camera { pose: CameraPose::Custom(0) }.describe(&["wave".into()]), "camera sees “wave”");
+    }
+
+    #[test]
+    fn body_sensing_conditions() {
+        let mut pose = crate::camera::pose::tests::standing(false, false);
+        let seen = |pose: &crate::camera::Pose| Detection::from_pose(Some(pose), &[]);
+        let touch = ConditionKind::BodyTouching.default_condition();
+        assert!(touch.is_camera() && touch.target().is_none());
+        assert!(!touch.evaluate_camera(&seen(&pose)));
+        pose.points[BodyPoint::LeftWrist.index()].x = 0.51;
+        pose.points[BodyPoint::RightWrist.index()].x = 0.49;
+        assert!(touch.evaluate_camera(&seen(&pose)), "hands together");
+        assert!(!touch.evaluate_camera(&Detection::default()), "nobody there");
+
+        let apart = Condition::BodyDistance { one: BodyPoint::LeftWrist, two: BodyPoint::RightWrist, cmp: Comparison::Less, distance: 5 };
+        assert!(apart.evaluate_camera(&seen(&pose)));
+        let nose_up = Condition::BodyPosition { axis: Axis::Y, point: BodyPoint::Nose, cmp: Comparison::Greater, value: 20 };
+        assert!(nose_up.evaluate_camera(&seen(&pose)));
+        let level = Condition::BodyAngle { one: BodyPoint::LeftShoulder, two: BodyPoint::RightShoulder, cmp: Comparison::Less, degrees: 5 };
+        assert!(level.evaluate_camera(&seen(&pose)));
+
+        let json = r#"{"sensor":"body_angle","one":"left_shoulder","two":"right_wrist","cmp":"Greater","degrees":999}"#;
+        let mut c: Condition = serde_json::from_str(json).unwrap();
+        c.sanitize();
+        assert_eq!(c, Condition::BodyAngle { one: BodyPoint::LeftShoulder, two: BodyPoint::RightWrist, cmp: Comparison::Greater, degrees: 359 });
     }
 
     #[test]

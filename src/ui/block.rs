@@ -1,13 +1,17 @@
 //! Drawing and editing a single block.
 
 use egui::{
-    Align2, Color32, CornerRadius, DragValue, FontId, Painter, Rect, Sense, Stroke, StrokeKind, Ui, vec2,
+    Align2, Color32, CornerRadius, DragValue, FontId, Painter, Rect, RichText, Sense, Stroke, StrokeKind, Ui, vec2,
     pos2,
 };
 
-use crate::hardware::{CardGroup, DeviceKind, Direction, LegoColor, Lever, Motor};
+use crate::audio::SoundOutput;
+use crate::camera::body::{MAX_DISTANCE, MAX_POSITION};
+use crate::camera::{Axis, BodyPoint, CameraPose};
+use crate::hardware::{BeepPattern, CardGroup, DeviceKind, Direction, LegoColor, Lever, Motor};
 use crate::program::condition::{Comparison, Condition, ConditionKind, MAX_DEGREES};
-use crate::visual::{Block, BlockKind, Category, MAX_REPEAT, MAX_ROTATIONS, MAX_SECONDS};
+use crate::program::tune::{self, Tune};
+use crate::visual::{Block, BlockKind, Category, DriveMode, MAX_BEEP_COUNT, MAX_REPEAT, MAX_ROTATIONS, MAX_SECONDS};
 
 use super::theme;
 
@@ -35,10 +39,20 @@ pub const FOOT_H: f32 = 22.0;
 enum Field {
     Motor,
     Direction,
+    DirectionToggle,
+    Mode,
     Speed,
+    Accel,
+    Decel,
     Seconds,
     Rotations,
     Count,
+    BeepPattern,
+    Note,
+    BeepCount,
+    TuneKind,
+    /// Loudness of sound on the computer.
+    Volume,
     CondKind,
     CondColor,
     CondCmp,
@@ -47,6 +61,12 @@ enum Field {
     CondDevice,
     CondMotor,
     CondLever,
+    CondPose,
+    CondPointA,
+    CondPointB,
+    CondAxis,
+    /// Distance, angle or position of body points.
+    CondNumber,
     Text(&'static str),
 }
 
@@ -62,6 +82,11 @@ impl Field {
                 | Field::CondDevice
                 | Field::CondMotor
                 | Field::CondLever
+                | Field::CondPose
+                | Field::CondPointA
+                | Field::CondPointB
+                | Field::CondAxis
+                | Field::CondNumber
         )
     }
 }
@@ -79,6 +104,19 @@ fn condition_rows(c: &Condition) -> Vec<Row> {
             vec![picker, vec![(CondMotor, 180.0)], vec![(CondCmp, 54.0), (CondDegrees, 84.0)]]
         }
         Condition::LeverPosition { .. } => vec![picker, vec![(CondLever, 80.0), (CondCmp, 54.0), (CondPercent, 70.0)]],
+        Condition::Camera { .. } => vec![picker, vec![(CondPose, 200.0)]],
+        Condition::BodyTouching { .. } => {
+            vec![picker, vec![(CondPointA, 130.0), (Text("touches"), 56.0)], vec![(CondPointB, 130.0)]]
+        }
+        Condition::BodyDistance { .. } | Condition::BodyAngle { .. } => vec![
+            picker,
+            vec![(Text("from"), 34.0), (CondPointA, 130.0)],
+            vec![(Text("to"), 34.0), (CondPointB, 130.0)],
+            vec![(CondCmp, 54.0), (CondNumber, 70.0)],
+        ],
+        Condition::BodyPosition { .. } => {
+            vec![picker, vec![(CondAxis, 50.0), (Text("of"), 18.0), (CondPointA, 130.0)], vec![(CondCmp, 54.0), (CondNumber, 70.0)]]
+        }
     }
 }
 
@@ -87,16 +125,37 @@ fn rows(kind: &BlockKind) -> Vec<Row> {
     use Field::*;
     let motor = vec![(Motor, 200.0)];
     let dir_speed = vec![(Direction, 136.0), (Text("speed"), 44.0), (Speed, 58.0)];
+    // Tap-to-toggle direction and speed/power, for the blocks that support power.
+    let toggles = vec![(DirectionToggle, 36.0), (Mode, 64.0), (Speed, 58.0)];
     match kind {
-        BlockKind::WhenRun | BlockKind::Forever | BlockKind::Beep { .. } => vec![],
-        BlockKind::RunMotor { .. } => vec![motor, dir_speed],
+        BlockKind::WhenRun | BlockKind::Forever => vec![],
+        BlockKind::Beep { output, .. } => {
+            let mut rows = vec![vec![(BeepPattern, 130.0), (Note, 70.0)], vec![(BeepCount, 60.0), (Text("times"), 50.0)]];
+            if output.computer() {
+                rows.push(vec![(Text("💻 volume"), 74.0), (Volume, 70.0)]);
+            }
+            rows
+        }
+        BlockKind::PlayTune { output, .. } => {
+            let mut rows = vec![vec![(TuneKind, 200.0)]];
+            if output.computer() {
+                rows.push(vec![(Text("💻 volume"), 74.0), (Volume, 70.0)]);
+            }
+            rows
+        }
+        BlockKind::RunMotor { .. } => vec![motor, toggles],
         BlockKind::StopMotor { .. } | BlockKind::ResetPosition { .. } => vec![motor],
         BlockKind::MotorForTime { .. } => {
-            vec![motor, dir_speed, vec![(Text("for"), 24.0), (Seconds, 70.0), (Text("seconds"), 60.0)]]
+            vec![motor, toggles, vec![(Text("for"), 24.0), (Seconds, 70.0), (Text("seconds"), 60.0)]]
         }
         BlockKind::MotorRotations { .. } => {
             vec![motor, dir_speed, vec![(Text("for"), 24.0), (Rotations, 70.0), (Text("rotations"), 70.0)]]
         }
+        BlockKind::SetAcceleration { .. } => vec![
+            motor,
+            vec![(Text("speed up"), 70.0), (Accel, 70.0)],
+            vec![(Text("slow down"), 70.0), (Decel, 70.0)],
+        ],
         BlockKind::Wait { .. } => vec![vec![(Seconds, 70.0), (Text("seconds"), 60.0)]],
         BlockKind::Repeat { .. } => vec![vec![(Count, 70.0), (Text("times"), 50.0)]],
         BlockKind::WaitUntil { condition }
@@ -164,18 +223,9 @@ fn motor_of(kind: &mut BlockKind) -> Option<&mut Motor> {
         | BlockKind::StopMotor { motor, .. }
         | BlockKind::ResetPosition { motor, .. }
         | BlockKind::MotorForTime { motor, .. }
-        | BlockKind::MotorRotations { motor, .. } => Some(motor),
+        | BlockKind::MotorRotations { motor, .. }
+        | BlockKind::SetAcceleration { motor, .. } => Some(motor),
         _ => None,
-    }
-}
-
-fn condition_group_mut(c: &mut Condition) -> &mut CardGroup {
-    match c {
-        Condition::ColorIs { group, .. }
-        | Condition::Reflection { group, .. }
-        | Condition::ButtonPressed { group, .. }
-        | Condition::MotorPosition { group, .. }
-        | Condition::LeverPosition { group, .. } => group,
     }
 }
 
@@ -186,9 +236,11 @@ fn card_group_mut(kind: &mut BlockKind) -> Option<&mut CardGroup> {
         | BlockKind::ResetPosition { group, .. }
         | BlockKind::MotorForTime { group, .. }
         | BlockKind::MotorRotations { group, .. }
-        | BlockKind::Beep { group } => Some(group),
+        | BlockKind::SetAcceleration { group, .. }
+        | BlockKind::Beep { group, .. }
+        | BlockKind::PlayTune { group, .. } => Some(group),
         BlockKind::WaitUntil { condition } | BlockKind::If { condition } | BlockKind::IfElse { condition } => {
-            Some(condition_group_mut(condition))
+            condition.group_mut()
         }
         _ => None,
     }
@@ -196,7 +248,7 @@ fn card_group_mut(kind: &mut BlockKind) -> Option<&mut CardGroup> {
 
 fn card_group(kind: &BlockKind) -> Option<CardGroup> {
     if let Some(condition) = kind.condition() {
-        Some(condition.target().group)
+        condition.group()
     } else {
         match kind {
             BlockKind::RunMotor { group, .. }
@@ -204,7 +256,9 @@ fn card_group(kind: &BlockKind) -> Option<CardGroup> {
             | BlockKind::ResetPosition { group, .. }
             | BlockKind::MotorForTime { group, .. }
             | BlockKind::MotorRotations { group, .. }
-            | BlockKind::Beep { group } => Some(*group),
+            | BlockKind::SetAcceleration { group, .. }
+            | BlockKind::Beep { group, .. }
+            | BlockKind::PlayTune { group, .. } => Some(*group),
             _ => None,
         }
     }
@@ -255,27 +309,88 @@ fn paint_card_group_dot(painter: &Painter, rect: Rect, group: CardGroup, hovered
     }
 }
 
-fn card_group_widget(ui: &mut Ui, header: Rect, id: u64, kind: &mut BlockKind) -> bool {
-    let Some(group) = card_group_mut(kind) else { return false };
-    let before = *group;
+fn sound_output_mut(kind: &mut BlockKind) -> Option<&mut SoundOutput> {
+    match kind {
+        BlockKind::Beep { output, .. } | BlockKind::PlayTune { output, .. } => Some(output),
+        _ => None,
+    }
+}
+
+fn sound_output(kind: &BlockKind) -> Option<SoundOutput> {
+    match kind {
+        BlockKind::Beep { output, .. } | BlockKind::PlayTune { output, .. } => Some(*output),
+        _ => None,
+    }
+}
+
+fn paint_computer_icon(painter: &Painter, rect: Rect, hovered: bool) {
+    let center = rect.center();
+    let radius = rect.width().min(rect.height()) * 0.5;
+    painter.circle_filled(center, radius, Color32::WHITE);
+    painter.circle_stroke(center, radius, Stroke::new(if hovered { 2.5 } else { 1.5 }, if hovered { theme::HIGHLIGHT } else { theme::TEXT }));
+    painter.text(center, Align2::CENTER_CENTER, "💻", FontId::proportional(radius * 1.25), theme::TEXT);
+}
+
+/// The card-group dot, or for sound blocks where they play: the dot for
+/// the devices, a computer for this computer, or both side by side.
+fn paint_target(painter: &Painter, header: Rect, kind: &BlockKind, group: CardGroup, hovered: bool) {
     let rect = card_group_dot_rect(header);
+    match sound_output(kind).unwrap_or_default() {
+        SoundOutput::Devices => paint_card_group_dot(painter, rect, group, hovered),
+        SoundOutput::Computer => paint_computer_icon(painter, rect, hovered),
+        SoundOutput::Both => {
+            paint_card_group_dot(painter, rect, group, hovered);
+            paint_computer_icon(painter, rect.translate(vec2(-20.0, 0.0)), hovered);
+        }
+    }
+}
+
+fn target_hover_text(kind: &BlockKind, group: CardGroup) -> String {
+    match sound_output(kind) {
+        Some(SoundOutput::Computer) => "Plays on this computer".into(),
+        Some(SoundOutput::Both) => format!("Plays on this computer and the {}", group.label()),
+        _ => format!("Card group: {}", group.label()),
+    }
+}
+
+fn card_group_widget(ui: &mut Ui, header: Rect, id: u64, kind: &mut BlockKind) -> bool {
+    let Some(&mut before) = card_group_mut(kind) else { return false };
+    let output_before = sound_output(kind);
+    let mut rect = card_group_dot_rect(header);
+    if output_before == Some(SoundOutput::Both) {
+        rect = rect.union(rect.translate(vec2(-20.0, 0.0)));
+    }
     let response = ui
         .interact(rect, egui::Id::new(("card_group", id)), Sense::click())
-        .on_hover_text(format!("Card group: {}", group.label()));
+        .on_hover_text(target_hover_text(kind, before));
     if response.hovered() {
-        paint_card_group_dot(ui.painter(), rect, *group, true);
+        paint_target(ui.painter(), header, kind, before, true);
     }
     egui::Popup::menu(&response).show(|ui| {
-        ui.set_min_width(130.0);
-        for option in CardGroup::SELECTABLE {
-            ui.horizontal(|ui| {
-                let (dot, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-                paint_card_group_dot(ui.painter(), dot, option, false);
-                ui.selectable_value(group, option, option.label());
-            });
+        ui.set_min_width(150.0);
+        if let Some(output) = sound_output_mut(kind) {
+            ui.label(RichText::new("Play on").strong());
+            for option in SoundOutput::ALL {
+                ui.radio_value(output, option, option.label());
+            }
+            ui.separator();
+            if !output.devices() {
+                ui.label(RichText::new("Card group (devices)").color(theme::TEXT_MUTED));
+            }
         }
+        let devices = sound_output(kind).is_none_or(SoundOutput::devices);
+        let Some(group) = card_group_mut(kind) else { return };
+        ui.add_enabled_ui(devices, |ui| {
+            for option in CardGroup::SELECTABLE {
+                ui.horizontal(|ui| {
+                    let (dot, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                    paint_card_group_dot(ui.painter(), dot, option, false);
+                    ui.selectable_value(group, option, option.label());
+                });
+            }
+        });
     });
-    *group != before
+    card_group(kind) != Some(before) || sound_output(kind) != output_before
 }
 
 fn card_group_dot_rect(header: Rect) -> Rect {
@@ -291,11 +406,33 @@ fn direction_of(kind: &mut BlockKind) -> Option<&mut Direction> {
     }
 }
 
+fn direction_icon(direction: Direction) -> &'static str {
+    match direction {
+        Direction::Clockwise => "↻",
+        Direction::CounterClockwise => "↺",
+    }
+}
+
+fn mode_of(kind: &mut BlockKind) -> Option<&mut DriveMode> {
+    match kind {
+        BlockKind::RunMotor { mode, .. } | BlockKind::MotorForTime { mode, .. } => Some(mode),
+        _ => None,
+    }
+}
+
 fn speed_of(kind: &mut BlockKind) -> Option<&mut i32> {
     match kind {
         BlockKind::RunMotor { speed, .. }
         | BlockKind::MotorForTime { speed, .. }
         | BlockKind::MotorRotations { speed, .. } => Some(speed),
+        _ => None,
+    }
+}
+
+fn percent_field_of(kind: &mut BlockKind, field: Field) -> Option<&mut i32> {
+    match (field, kind) {
+        (Field::Accel, BlockKind::SetAcceleration { acceleration, .. }) => Some(acceleration),
+        (Field::Decel, BlockKind::SetAcceleration { deceleration, .. }) => Some(deceleration),
         _ => None,
     }
 }
@@ -311,7 +448,10 @@ fn cmp_of(c: &mut Condition) -> Option<&mut Comparison> {
     match c {
         Condition::Reflection { cmp, .. }
         | Condition::MotorPosition { cmp, .. }
-        | Condition::LeverPosition { cmp, .. } => Some(cmp),
+        | Condition::LeverPosition { cmp, .. }
+        | Condition::BodyDistance { cmp, .. }
+        | Condition::BodyAngle { cmp, .. }
+        | Condition::BodyPosition { cmp, .. } => Some(cmp),
         _ => None,
     }
 }
@@ -324,12 +464,36 @@ fn percent_of(c: &mut Condition) -> Option<(&mut i32, i32)> {
     }
 }
 
-fn field_text(kind: &BlockKind, field: Field) -> String {
+/// Body points of a camera body-sensing condition: (first, second).
+fn body_points_of(c: &mut Condition) -> Option<(&mut BodyPoint, Option<&mut BodyPoint>)> {
+    match c {
+        Condition::BodyTouching { one, two } | Condition::BodyDistance { one, two, .. } | Condition::BodyAngle { one, two, .. } => {
+            Some((one, Some(two)))
+        }
+        Condition::BodyPosition { point, .. } => Some((point, None)),
+        _ => None,
+    }
+}
+
+/// The number of a body-sensing condition with its range and unit.
+fn body_number_of(c: &mut Condition) -> Option<(&mut i32, i32, i32, &'static str)> {
+    match c {
+        Condition::BodyDistance { distance, .. } => Some((distance, 0, MAX_DISTANCE, "")),
+        Condition::BodyAngle { degrees, .. } => Some((degrees, 0, 359, "°")),
+        Condition::BodyPosition { value, .. } => Some((value, -MAX_POSITION, MAX_POSITION, "")),
+        _ => None,
+    }
+}
+
+fn field_text(kind: &BlockKind, field: Field, poses: &[String]) -> String {
     let mut k = kind.clone();
     let text = match field {
         Field::Motor => motor_of(&mut k).map(|m| m.label().to_string()),
         Field::Direction => direction_of(&mut k).map(|d| d.label().to_string()),
+        Field::DirectionToggle => direction_of(&mut k).map(|d| direction_icon(*d).to_string()),
+        Field::Mode => mode_of(&mut k).map(|m| m.label().to_string()),
         Field::Speed => speed_of(&mut k).map(|s| format!("{s} %")),
+        Field::Accel | Field::Decel => percent_field_of(&mut k, field).map(|p| format!("{p} %")),
         Field::Seconds => seconds_of(&mut k).map(|s| format!("{s:.1} s")),
         Field::Rotations => match k {
             BlockKind::MotorRotations { rotations, .. } => Some(format!("{rotations:.1}")),
@@ -339,14 +503,39 @@ fn field_text(kind: &BlockKind, field: Field) -> String {
             BlockKind::Repeat { count } => Some(count.to_string()),
             _ => None,
         },
+        Field::BeepPattern => match k {
+            BlockKind::Beep { pattern, .. } => Some(pattern.label().to_string()),
+            _ => None,
+        },
+        Field::Note => match k {
+            BlockKind::Beep { note, .. } => Some(tune::note_name(note)),
+            _ => None,
+        },
+        Field::BeepCount => match k {
+            BlockKind::Beep { count, .. } => Some(count.to_string()),
+            _ => None,
+        },
+        Field::TuneKind => match k {
+            BlockKind::PlayTune { tune, .. } => Some(tune.label().to_string()),
+            _ => None,
+        },
+        Field::Volume => match k {
+            BlockKind::Beep { volume, .. } | BlockKind::PlayTune { volume, .. } => Some(format!("{volume} %")),
+            _ => None,
+        },
         Field::Text(t) => Some(t.to_string()),
-        _ => k.condition_mut().map(|c| condition_field_text(c, field)),
+        _ => k.condition_mut().map(|c| condition_field_text(c, field, poses)),
     };
     text.unwrap_or_default()
 }
 
-fn condition_field_text(c: &mut Condition, field: Field) -> String {
+fn condition_field_text(c: &mut Condition, field: Field, poses: &[String]) -> String {
     match (field, &*c) {
+        (Field::CondPose, Condition::Camera { pose }) => pose.label(poses),
+        (Field::CondAxis, Condition::BodyPosition { axis, .. }) => axis.label().to_string(),
+        (Field::CondPointA, _) => body_points_of(c).map(|(a, _)| a.label().to_string()).unwrap_or_default(),
+        (Field::CondPointB, _) => body_points_of(c).and_then(|(_, b)| b.map(|b| b.label().to_string())).unwrap_or_default(),
+        (Field::CondNumber, _) => body_number_of(c).map(|(v, _, _, unit)| format!("{v}{unit}")).unwrap_or_default(),
         (Field::CondKind, _) => c.kind().label().to_string(),
         (Field::CondColor, Condition::ColorIs { color, .. }) => color.label().to_string(),
         (Field::CondDevice, Condition::ButtonPressed { device, .. }) => device.label().to_string(),
@@ -400,8 +589,9 @@ fn pieces(rect: Rect, slots: &[(f32, f32)], kind: &BlockKind) -> Vec<(Rect, Corn
     out
 }
 
-/// Paint the body, header, condition area and (optionally) static field values.
-pub fn paint_block(painter: &Painter, rect: Rect, slots: &[(f32, f32)], kind: &BlockKind, look: Look) {
+/// Paint the body, header, condition area and (optionally) static field
+/// values. `poses` names the project's trained camera poses.
+pub fn paint_block(painter: &Painter, rect: Rect, slots: &[(f32, f32)], kind: &BlockKind, look: Look, poses: &[String]) {
     let style = theme::category(kind.category());
     let a = look.fade;
     let parts = pieces(rect, slots, kind);
@@ -471,12 +661,22 @@ pub fn paint_block(painter: &Painter, rect: Rect, slots: &[(f32, f32)], kind: &B
             Field::Text(t) => {
                 painter.text(frect.left_center(), Align2::LEFT_CENTER, t, FontId::proportional(14.0), col);
             }
+            Field::DirectionToggle if look.static_fields => {
+                painter.rect_filled(frect, CornerRadius::same(12), Color32::WHITE.gamma_multiply(a));
+                painter.text(
+                    frect.center(),
+                    Align2::CENTER_CENTER,
+                    field_text(kind, field, poses),
+                    FontId::proportional(17.0),
+                    theme::TEXT.gamma_multiply(a),
+                );
+            }
             _ if look.static_fields => {
                 painter.rect_filled(frect, CornerRadius::same(12), Color32::WHITE.gamma_multiply(a));
                 painter.text(
                     frect.left_center() + vec2(9.0, 0.0),
                     Align2::LEFT_CENTER,
-                    field_text(kind, field),
+                    field_text(kind, field, poses),
                     FontId::proportional(13.5),
                     theme::TEXT.gamma_multiply(a),
                 );
@@ -486,7 +686,7 @@ pub fn paint_block(painter: &Painter, rect: Rect, slots: &[(f32, f32)], kind: &B
     }
 
     if let Some(group) = card_group(kind) {
-        paint_card_group_dot(painter, card_group_dot_rect(header), group, false);
+        paint_target(painter, header, kind, group, false);
     }
 
     if look.active && container {
@@ -560,7 +760,7 @@ fn combo<T: PartialEq + Copy>(
 
 /// Interactive parameter editors placed on top of a painted block header.
 /// Returns true if anything changed.
-pub fn field_widgets(ui: &mut Ui, header: Rect, id: u64, kind: &mut BlockKind) -> bool {
+pub fn field_widgets(ui: &mut Ui, header: Rect, id: u64, kind: &mut BlockKind, poses: &[String]) -> bool {
     let before = kind.clone();
     for (i, (field, frect)) in field_rects(kind, header).into_iter().enumerate() {
         let salt = ("field", id, i);
@@ -580,9 +780,55 @@ pub fn field_widgets(ui: &mut Ui, header: Rect, id: u64, kind: &mut BlockKind) -
                     combo(ui, salt, w, d, &[Direction::Clockwise, Direction::CounterClockwise], |d| d.label().into());
                 }
             }
+            Field::DirectionToggle => {
+                if let Some(d) = direction_of(kind) {
+                    let name = match *d {
+                        Direction::Clockwise => "Clockwise",
+                        Direction::CounterClockwise => "Anticlockwise",
+                    };
+                    // Empty button at the field's exact size, with the arrow painted on top,
+                    // so the larger glyph can't make it taller than the other fields.
+                    let response = ui
+                        .add_sized(frect.size(), egui::Button::new(""))
+                        .on_hover_text(format!("{name}\nTap to change direction"));
+                    ui.painter().text(
+                        response.rect.center(),
+                        Align2::CENTER_CENTER,
+                        direction_icon(*d),
+                        FontId::proportional(17.0),
+                        theme::TEXT,
+                    );
+                    if response.clicked() {
+                        *d = match *d {
+                            Direction::Clockwise => Direction::CounterClockwise,
+                            Direction::CounterClockwise => Direction::Clockwise,
+                        };
+                    }
+                }
+            }
+            Field::Mode => {
+                if let Some(m) = mode_of(kind) {
+                    let tapped = ui
+                        .add_sized(frect.size(), egui::Button::new(m.label()).wrap_mode(egui::TextWrapMode::Extend))
+                        .on_hover_text(
+                            "Tap to switch between speed and power.\n\
+                             Speed: the motor holds a steady speed.\n\
+                             Power: fixed power, faster at 100% but slows down under load.",
+                        )
+                        .clicked();
+                    if tapped {
+                        *m = m.toggled();
+                    }
+                }
+            }
             Field::Speed => {
                 if let Some(speed) = speed_of(kind) {
                     ui.add_sized(frect.size(), DragValue::new(speed).range(0..=100).speed(0.5).suffix(" %"));
+                }
+            }
+            Field::Accel | Field::Decel => {
+                if let Some(p) = percent_field_of(kind, field) {
+                    ui.add_sized(frect.size(), DragValue::new(p).range(0..=100).speed(0.5).suffix(" %"));
                 }
             }
             Field::Seconds => {
@@ -603,9 +849,35 @@ pub fn field_widgets(ui: &mut Ui, header: Rect, id: u64, kind: &mut BlockKind) -
                     ui.add_sized(frect.size(), DragValue::new(count).range(0..=MAX_REPEAT).speed(0.1));
                 }
             }
+            Field::BeepPattern => {
+                if let BlockKind::Beep { pattern, .. } = kind {
+                    combo(ui, salt, w, pattern, &BeepPattern::ALL, |p| p.label().into());
+                }
+            }
+            Field::Note => {
+                if let BlockKind::Beep { note, .. } = kind {
+                    combo(ui, salt, w, note, &tune::NOTES, tune::note_name);
+                }
+            }
+            Field::BeepCount => {
+                if let BlockKind::Beep { count, .. } = kind {
+                    ui.add_sized(frect.size(), DragValue::new(count).range(1..=MAX_BEEP_COUNT).speed(0.1));
+                }
+            }
+            Field::Volume => {
+                if let BlockKind::Beep { volume, .. } | BlockKind::PlayTune { volume, .. } = kind {
+                    ui.add_sized(frect.size(), DragValue::new(volume).range(0..=100).speed(0.5).suffix(" %"))
+                        .on_hover_text("How loud it plays on this computer. The LEGO devices always beep at the same loudness.");
+                }
+            }
+            Field::TuneKind => {
+                if let BlockKind::PlayTune { tune, .. } = kind {
+                    combo(ui, salt, w, tune, &Tune::ALL, |t| t.label().into());
+                }
+            }
             _ => {
                 if let Some(c) = kind.condition_mut() {
-                    condition_widget(ui, salt, frect, field, c);
+                    condition_widget(ui, salt, frect, field, c, poses);
                 }
             }
         }
@@ -615,7 +887,7 @@ pub fn field_widgets(ui: &mut Ui, header: Rect, id: u64, kind: &mut BlockKind) -
     *kind != before || group_changed
 }
 
-fn condition_widget(ui: &mut Ui, salt: (&str, u64, usize), frect: Rect, field: Field, c: &mut Condition) {
+fn condition_widget(ui: &mut Ui, salt: (&str, u64, usize), frect: Rect, field: Field, c: &mut Condition, poses: &[String]) {
     let w = frect.width();
     match field {
         Field::CondKind => {
@@ -635,6 +907,24 @@ fn condition_widget(ui: &mut Ui, salt: (&str, u64, usize), frect: Rect, field: F
                 ui.add_sized(frect.size(), DragValue::new(p).range(min..=100).speed(0.5).suffix(" %"));
             }
         }
+        Field::CondPointA | Field::CondPointB => {
+            if let Some((a, b)) = body_points_of(c) {
+                let point = if field == Field::CondPointA { Some(a) } else { b };
+                if let Some(point) = point {
+                    combo(ui, salt, w, point, &BodyPoint::ALL, |p| p.label().into());
+                }
+            }
+        }
+        Field::CondAxis => {
+            if let Condition::BodyPosition { axis, .. } = c {
+                combo(ui, salt, w, axis, &[Axis::X, Axis::Y], |a| a.label().into());
+            }
+        }
+        Field::CondNumber => {
+            if let Some((v, min, max, unit)) = body_number_of(c) {
+                ui.add_sized(frect.size(), DragValue::new(v).range(min..=max).speed(0.5).suffix(unit));
+            }
+        }
         _ => match c {
             Condition::ColorIs { color, .. } => {
                 let colors: Vec<LegoColor> = LegoColor::ALL.into_iter().filter(|c| *c != LegoColor::None).collect();
@@ -651,7 +941,10 @@ fn condition_widget(ui: &mut Ui, salt: (&str, u64, usize), frect: Rect, field: F
             Condition::LeverPosition { lever, .. } => {
                 combo(ui, salt, w, lever, &[Lever::Left, Lever::Right], |l| l.label().into());
             }
-            Condition::Reflection { .. } => {}
+            Condition::Camera { pose } => {
+                combo(ui, salt, w, pose, &CameraPose::options(poses), |p| p.label(poses));
+            }
+            _ => {}
         },
     }
 }

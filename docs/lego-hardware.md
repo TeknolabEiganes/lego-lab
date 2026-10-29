@@ -96,7 +96,7 @@ They start with the motor bit mask, so responses can be matched per motor.
 | Id | Message | Payload |
 | --- | --- | --- |
 | 110 | LightColor | colour `i8`, pattern `u8`, intensity `u8` |
-| 112 | PlayBeep | pattern `u8`, frequency `u16`, repetitions `u8` |
+| 112 | PlayBeep | pattern `u8` (0 single, 1 double, 2 triple, 3 up-middle-down), frequency `u16` (0–2700 Hz), repetitions `u8` (plays after the first, so 0 = once) |
 | 114 | StopSound | – |
 | 120 | MotorResetRelativePosition | motor mask `u8`, position `i32` |
 | 122 | MotorRun | motor mask `u8`, direction `u8` |
@@ -217,6 +217,10 @@ test on a Double Motor.
   fails with "No discovery started"), so nothing is found. LEGO Lab scans
   unfiltered and filters on the service UUID and LEGO manufacturer data
   itself.
+* **Beep replies (inferred, Oct 2026):** a `PlayBeep` result seems to arrive
+  only once the sound has finished, so a 3 s reply timeout cut off longer
+  beeps (5 repeats played only 2–3 times) and waiting for each reply made
+  tunes very slow. Beeps now wait per repeat, and tune notes don't wait.
 * **Protocol 1.0 vs 2.0:** devices on older firmware report RPC 1.0.73. The
   official package 1.0.6 speaks 1.0.73, 1.1.1 speaks 2.0.5, and their
   `rpc_message.py` files are identical apart from the version numbers.

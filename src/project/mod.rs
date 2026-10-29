@@ -5,6 +5,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::camera::pose::{self, PoseClass};
 use crate::visual::Workspace;
 
 pub const FORMAT_VERSION: u32 = 1;
@@ -18,11 +19,14 @@ pub struct Project {
     pub name: String,
     #[serde(flatten)]
     pub workspace: Workspace,
+    /// Camera poses the project has been taught.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub poses: Vec<PoseClass>,
 }
 
 impl Project {
     pub fn new(name: impl Into<String>, workspace: Workspace) -> Self {
-        Self { version: FORMAT_VERSION, name: name.into(), workspace }
+        Self { version: FORMAT_VERSION, name: name.into(), workspace, poses: Vec::new() }
     }
 
     pub fn to_json(&self) -> Result<String> {
@@ -43,6 +47,7 @@ impl Project {
         }
         project.version = FORMAT_VERSION;
         project.workspace.sanitize();
+        pose::sanitize_classes(&mut project.poses);
         Ok(project)
     }
 
@@ -78,6 +83,19 @@ mod tests {
         p.workspace.sanitize();
         let back = Project::from_json(&p.to_json().unwrap()).unwrap();
         assert_eq!(back, p);
+    }
+
+    #[test]
+    fn trained_poses_round_trip() {
+        let mut p = Project::new("Dance", Workspace::example());
+        p.workspace.sanitize();
+        let mut wave = PoseClass::new("wave");
+        wave.examples.push(crate::camera::pose::tests::standing(true, false));
+        p.poses.push(wave);
+        let back = Project::from_json(&p.to_json().unwrap()).unwrap();
+        assert_eq!(back.poses.len(), 1);
+        assert_eq!(back.poses[0].name, "wave");
+        assert_eq!(back.poses[0].examples[0].builtin(), Some(crate::camera::CameraPose::LeftArmUp));
     }
 
     #[test]

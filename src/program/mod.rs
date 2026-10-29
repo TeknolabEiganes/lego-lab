@@ -2,13 +2,16 @@
 
 pub mod compiler;
 pub mod condition;
+pub mod tune;
 
 use serde::{Deserialize, Serialize};
 
-use crate::hardware::{CardGroup, Direction, Motor, Speed};
+use crate::audio::SoundOutput;
+use crate::hardware::{CardGroup, Direction, Motor, Speed, Tone};
 use crate::visual::BlockId;
 
 pub use condition::Condition;
+use tune::TuneNote;
 
 /// A single instruction. Control-flow commands contain nested steps.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -37,12 +40,45 @@ pub enum Command {
         motor: Motor,
         group: CardGroup,
     },
+    /// Run continuously at a fixed power (duty cycle), 0–100%.
+    MotorRunPower {
+        motor: Motor,
+        group: CardGroup,
+        direction: Direction,
+        power: u8,
+    },
+    /// Run at a fixed power (duty cycle) for a duration, then stop.
+    MotorRunPowerForTime {
+        motor: Motor,
+        group: CardGroup,
+        direction: Direction,
+        power: u8,
+        milliseconds: u64,
+    },
+    /// Acceleration and deceleration, 0–100% each.
+    MotorSetAcceleration {
+        motor: Motor,
+        group: CardGroup,
+        acceleration: u8,
+        deceleration: u8,
+    },
     MotorResetPosition {
         motor: Motor,
         group: CardGroup,
     },
     Beep {
         group: CardGroup,
+        tone: Tone,
+        output: SoundOutput,
+        /// Volume on the computer, 0–100%.
+        volume: u32,
+    },
+    /// Single beeps, each followed by a pause until the next note.
+    PlayTune {
+        group: CardGroup,
+        notes: Vec<TuneNote>,
+        output: SoundOutput,
+        volume: u32,
     },
     Wait {
         milliseconds: u64,

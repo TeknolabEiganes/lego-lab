@@ -12,12 +12,26 @@ use super::theme;
 fn description(kind: &BlockKind) -> &'static str {
     match kind {
         BlockKind::WhenRun => "Your program starts here when you press RUN.",
-        BlockKind::RunMotor { .. } => "Start a motor and keep it running.",
+        BlockKind::RunMotor { .. } => {
+            "Start a motor and keep it running. Tap the direction or speed/power to switch them."
+        }
         BlockKind::StopMotor { .. } => "Stop a motor.",
         BlockKind::ResetPosition { .. } => "Count the motor's position from 0° again (it also starts at 0° on RUN).",
-        BlockKind::MotorForTime { .. } => "Run a motor for some seconds, then stop.",
+        BlockKind::MotorForTime { .. } => {
+            "Run a motor for some seconds, then stop. Tap the direction or speed/power to switch them."
+        }
         BlockKind::MotorRotations { .. } => "Turn a motor a number of rotations, then stop.",
-        BlockKind::Beep { .. } => "Play a short beep on devices in the selected card group.",
+        BlockKind::SetAcceleration { .. } => {
+            "How quickly a motor speeds up and slows down (100% = quickest). \
+             Applies to the motor blocks that come after it."
+        }
+        BlockKind::Beep { .. } => {
+            "Play a beep pattern on devices in the selected card group, on this computer, or both \
+             (tap the dot at the top right). Pick the note and how many times."
+        }
+        BlockKind::PlayTune { .. } => {
+            "Play a short tune on devices in the selected card group, on this computer, or both (tap the dot at the top right)."
+        }
         BlockKind::Wait { .. } => "Wait before doing the next block.",
         BlockKind::WaitUntil { .. } => "Wait until a sensor condition is true.",
         BlockKind::Repeat { .. } => "Do the blocks inside a number of times.",
@@ -34,6 +48,19 @@ fn sensor_description(kind: ConditionKind) -> &'static str {
         ConditionKind::Button => "The button on a device is pressed.",
         ConditionKind::MotorPosition => "How far a motor has turned, in degrees.",
         ConditionKind::Lever => "Where a Controller lever is pushed (−100 to 100%).",
+        ConditionKind::Camera => {
+            "The computer's camera sees a person, raised arms, or a pose you taught it in the Camera pane."
+        }
+        ConditionKind::BodyTouching => "The camera sees two body points touch, e.g. your hands (wrists) together.",
+        ConditionKind::BodyDistance => {
+            "How far apart two body points are on the camera (the picture is 90 tall). The Camera pane shows live values."
+        }
+        ConditionKind::BodyAngle => {
+            "Which way one body point is from another on the camera: 0° right, 90° up, 180° left, 270° down."
+        }
+        ConditionKind::BodyPosition => {
+            "Where a body point is on the camera: 0 is the middle, y is 45 at the top and −45 at the bottom."
+        }
     }
 }
 

@@ -2,6 +2,8 @@
 //! Computer Science & AI kits.
 
 mod app;
+mod audio;
+mod camera;
 mod executor;
 mod hardware;
 mod program;

@@ -117,6 +117,48 @@ impl Speed {
     }
 }
 
+/// Built-in beep patterns of the devices (firmware numbering in `protocol`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum BeepPattern {
+    #[default]
+    Single,
+    Double,
+    Triple,
+    /// Three notes: up, middle, down.
+    UpMiddleDown,
+}
+
+impl BeepPattern {
+    pub const ALL: [BeepPattern; 4] = [BeepPattern::Single, BeepPattern::Double, BeepPattern::Triple, BeepPattern::UpMiddleDown];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BeepPattern::Single => "beep",
+            BeepPattern::Double => "double beep",
+            BeepPattern::Triple => "triple beep",
+            BeepPattern::UpMiddleDown => "up & down",
+        }
+    }
+}
+
+/// Highest frequency the devices accept (LEGO's package validates 0–2700 Hz).
+pub const MAX_BEEP_HZ: u16 = 2700;
+
+/// What a beep plays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tone {
+    pub pattern: BeepPattern,
+    pub frequency: u16,
+    /// How many times the pattern plays (at least 1).
+    pub count: u8,
+}
+
+impl Default for Tone {
+    fn default() -> Self {
+        Tone { pattern: BeepPattern::Single, frequency: 440, count: 1 }
+    }
+}
+
 /// Every device type in the LEGO Education Computer Science & AI kits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum DeviceKind {
@@ -404,11 +446,35 @@ pub trait LegoDevice: Send + Sync {
 
     async fn motor_stop(&self, motor: Motor, group: CardGroup) -> HwResult<()>;
 
+    /// Start a motor running continuously at a fixed power (duty cycle,
+    /// 0–100%) without speed regulation.
+    async fn motor_run_power(&self, motor: Motor, group: CardGroup, direction: Direction, power: u8) -> HwResult<()>;
+
+    /// Run a motor at a fixed power for a duration, then stop it. There is no
+    /// such command in the protocol, so backends time it themselves.
+    async fn motor_run_power_for_time(
+        &self,
+        motor: Motor,
+        group: CardGroup,
+        direction: Direction,
+        power: u8,
+        duration: Duration,
+    ) -> HwResult<()>;
+
+    /// Set how quickly a motor speeds up and slows down (0–100% each).
+    async fn motor_set_acceleration(&self, motor: Motor, group: CardGroup, acceleration: u8, deceleration: u8)
+        -> HwResult<()>;
+
     /// Set a motor's position count back to 0°.
     async fn motor_reset_position(&self, motor: Motor, group: CardGroup) -> HwResult<()>;
 
-    /// Play the default short beep on every connected device in a card group.
-    async fn beep(&self, group: CardGroup) -> HwResult<()>;
+    /// Play a beep on every connected device in a card group, resolving
+    /// when it has finished playing.
+    async fn beep(&self, group: CardGroup, tone: Tone) -> HwResult<()>;
+
+    /// Start a beep without waiting for it to finish (for tunes, where the
+    /// next note follows on a fixed beat).
+    async fn beep_start(&self, group: CardGroup, tone: Tone) -> HwResult<()>;
 
     /// Set every connected motor's position count back to 0° (done when a
     /// program starts, so "motor position" means "turned since RUN").

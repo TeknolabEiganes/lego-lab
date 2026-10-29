@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use super::{
     AttachedDevice, CardGroup, ConnectionState, DeviceKind, DeviceSnapshot, Direction, HardwareError,
-    HwResult, LegoDevice, Lever, Motor, SensorQuery, SensorValue, Speed,
+    HwResult, LegoDevice, Lever, Motor, SensorQuery, SensorValue, Speed, Tone,
 };
 use protocol::{Advert, CommandStatus, Notification, ResponseKey};
 
@@ -40,6 +40,9 @@ pub const LEGO_COMPANY_ID: u16 = 0x0397;
 const SCAN_TIME: Duration = Duration::from_secs(4);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
+/// Extra reply time per play of a beep pattern: the device only answers a
+/// beep once it has finished playing.
+const BEEP_PLAY_ALLOWANCE: Duration = Duration::from_secs(4);
 const NOTIFY_INTERVAL_MS: u16 = 50;
 /// Re-sending an identical "run" within this window is skipped, so a
 /// Forever loop doesn't flood the radio with the same command.
@@ -74,7 +77,14 @@ struct Link {
     pending: Mutex<HashMap<ResponseKey, VecDeque<oneshot::Sender<Vec<u8>>>>>,
     live: Mutex<Live>,
     alive: AtomicBool,
-    last_run: Mutex<HashMap<u8, (u8, Direction, Instant)>>,
+    last_run: Mutex<HashMap<u8, (Drive, Direction, Instant)>>,
+}
+
+/// How a continuously running motor was started (for skipping repeats).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drive {
+    Speed(u8),
+    Power(u8),
 }
 
 impl Link {
@@ -177,8 +187,10 @@ impl Link {
         }
     }
 
-    async fn sound_command(&self, data: &[u8], result_id: u8) -> HwResult<()> {
-        let reply = self.request(data, (result_id, None), REPLY_TIMEOUT).await?;
+    /// The device replies when the sound has finished, so the wait must
+    /// cover every beep.
+    async fn sound_command(&self, data: &[u8], result_id: u8, timeout: Duration) -> HwResult<()> {
+        let reply = self.request(data, (result_id, None), timeout).await?;
         if protocol::parse_status(&reply) == Some(CommandStatus::Refused) {
             Err(comm(format!("the {} refused the sound command", self.kind.label())))
         } else {
@@ -410,6 +422,15 @@ impl LegoBleDevice {
         if links.is_empty() { Err(HardwareError::DeviceMissing(kind)) } else { Ok(links) }
     }
 
+    /// Every connected device in a card group (they can all beep).
+    fn beep_links(&self, group: CardGroup) -> HwResult<Vec<Arc<Link>>> {
+        if self.connection() != ConnectionState::Connected {
+            return Err(HardwareError::NotConnected);
+        }
+        let links: Vec<_> = self.links().into_iter().filter(|link| group.matches_device_group(link.group())).collect();
+        if links.is_empty() { Err(HardwareError::DeviceGroupMissing(group)) } else { Ok(links) }
+    }
+
     /// Bluetooth addresses of the connected devices.
     pub fn connected_addresses(&self) -> Vec<String> {
         self.links().iter().map(|l| l.peripheral.address().to_string()).collect()
@@ -544,6 +565,44 @@ impl LegoBleDevice {
         Ok(())
     }
 
+    /// Start a motor running continuously, at a regulated speed or a fixed power.
+    async fn run_continuous(&self, motor: Motor, group: CardGroup, direction: Direction, drive: Drive) -> HwResult<()> {
+        let links = self.links_for(motor.device(), group)?;
+        let mask = protocol::motor_mask(motor);
+        let (data, result) = match drive {
+            Drive::Speed(pct) => {
+                // Speed is a separate message, sent in the same write (as LEGO's package does).
+                let mut data = protocol::motor_set_speed(mask, pct as i8);
+                data.extend(protocol::motor_run(mask, direction));
+                (data, protocol::MOTOR_RUN_RESULT)
+            }
+            // Duty cycle has no direction field: the sign is the direction.
+            Drive::Power(pct) => (
+                protocol::motor_set_duty_cycle(mask, pct as i8 * direction.sign()),
+                protocol::MOTOR_SET_DUTY_CYCLE_RESULT,
+            ),
+        };
+        let results = futures::future::join_all(links.into_iter().map(|link| {
+            let data = data.clone();
+            async move {
+                let repeated = link
+                    .last_run
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&mask)
+                    .is_some_and(|(s, d, t)| *s == drive && *d == direction && t.elapsed() < DEDUPE_WINDOW);
+                if repeated {
+                    return Ok(());
+                }
+                link.motor_command(&data, result, mask, REPLY_TIMEOUT).await?;
+                link.last_run.lock().unwrap_or_else(|e| e.into_inner()).insert(mask, (drive, direction, Instant::now()));
+                Ok(())
+            }
+        }))
+        .await;
+        results.into_iter().find(|r| r.is_err()).unwrap_or(Ok(()))
+    }
+
     async fn run_with_speed(
         &self,
         motor: Motor,
@@ -651,27 +710,7 @@ impl LegoDevice for LegoBleDevice {
     }
 
     async fn motor_run(&self, motor: Motor, group: CardGroup, direction: Direction, speed: Speed) -> HwResult<()> {
-        let links = self.links_for(motor.device(), group)?;
-        let mask = protocol::motor_mask(motor);
-        let pct = speed.percent();
-        let results = futures::future::join_all(links.into_iter().map(|link| async move {
-            let repeated = link
-                .last_run
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&mask)
-                .is_some_and(|(s, d, t)| *s == pct && *d == direction && t.elapsed() < DEDUPE_WINDOW);
-            if repeated {
-                return Ok(());
-            }
-            let mut data = protocol::motor_set_speed(mask, pct as i8);
-            data.extend(protocol::motor_run(mask, direction));
-            link.motor_command(&data, protocol::MOTOR_RUN_RESULT, mask, REPLY_TIMEOUT).await?;
-            link.last_run.lock().unwrap_or_else(|e| e.into_inner()).insert(mask, (pct, direction, Instant::now()));
-            Ok(())
-        }))
-        .await;
-        results.into_iter().find(|r| r.is_err()).unwrap_or(Ok(()))
+        self.run_continuous(motor, group, direction, Drive::Speed(speed.percent())).await
     }
 
     async fn motor_run_for_time(
@@ -717,6 +756,59 @@ impl LegoDevice for LegoBleDevice {
         results.into_iter().find(|r| r.is_err()).unwrap_or(Ok(()))
     }
 
+    async fn motor_run_power(&self, motor: Motor, group: CardGroup, direction: Direction, power: u8) -> HwResult<()> {
+        self.run_continuous(motor, group, direction, Drive::Power(power.min(100))).await
+    }
+
+    async fn motor_run_power_for_time(
+        &self,
+        motor: Motor,
+        group: CardGroup,
+        direction: Direction,
+        power: u8,
+        duration: Duration,
+    ) -> HwResult<()> {
+        let drive = Drive::Power(power.min(100));
+        self.run_continuous(motor, group, direction, drive).await?;
+        tokio::time::sleep(duration).await;
+        // Only stop motors still running this command: another block may
+        // have taken over (or stopped them) in the meantime.
+        let links = self.links_for(motor.device(), group)?;
+        let mask = protocol::motor_mask(motor);
+        let stops = links.into_iter().filter_map(|link| {
+            let mut last_run = link.last_run.lock().unwrap_or_else(|e| e.into_inner());
+            let still_ours = last_run.get(&mask).is_some_and(|(d, dir, _)| *d == drive && *dir == direction);
+            if !still_ours {
+                return None;
+            }
+            last_run.remove(&mask);
+            drop(last_run);
+            Some(async move {
+                link.motor_command(&protocol::motor_stop(mask), protocol::MOTOR_STOP_RESULT, mask, REPLY_TIMEOUT).await
+            })
+        });
+        let results = futures::future::join_all(stops).await;
+        results.into_iter().find(|r| r.is_err()).unwrap_or(Ok(()))
+    }
+
+    async fn motor_set_acceleration(
+        &self,
+        motor: Motor,
+        group: CardGroup,
+        acceleration: u8,
+        deceleration: u8,
+    ) -> HwResult<()> {
+        let links = self.links_for(motor.device(), group)?;
+        let mask = protocol::motor_mask(motor);
+        let data = protocol::motor_set_acceleration(mask, acceleration, deceleration);
+        let results = futures::future::join_all(links.into_iter().map(|link| {
+            let data = data.clone();
+            async move { link.motor_command(&data, protocol::MOTOR_SET_ACCELERATION_RESULT, mask, REPLY_TIMEOUT).await }
+        }))
+        .await;
+        results.into_iter().find(|r| r.is_err()).unwrap_or(Ok(()))
+    }
+
     async fn motor_reset_position(&self, motor: Motor, group: CardGroup) -> HwResult<()> {
         let links = self.links_for(motor.device(), group)?;
         let mask = protocol::motor_mask(motor);
@@ -731,25 +823,31 @@ impl LegoDevice for LegoBleDevice {
         results.into_iter().find(|r| r.is_err()).unwrap_or(Ok(()))
     }
 
-    async fn beep(&self, group: CardGroup) -> HwResult<()> {
-        if self.connection() != ConnectionState::Connected {
-            return Err(HardwareError::NotConnected);
-        }
-        let links: Vec<_> = self
-            .links()
-            .into_iter()
-            .filter(|link| group.matches_device_group(link.group()))
-            .collect();
-        if links.is_empty() {
-            return Err(HardwareError::DeviceGroupMissing(group));
-        }
-        let command = protocol::play_beep();
+    async fn beep(&self, group: CardGroup, tone: Tone) -> HwResult<()> {
+        let links = self.beep_links(group)?;
+        let command = protocol::play_beep(tone);
+        // The reply only comes once every beep has played, so allow plenty of time.
+        let timeout = REPLY_TIMEOUT + BEEP_PLAY_ALLOWANCE * tone.count.max(1) as u32;
         let results = futures::future::join_all(links.into_iter().map(|link| {
             let command = command.clone();
-            async move { link.sound_command(&command, protocol::PLAY_BEEP_RESULT).await }
+            async move { link.sound_command(&command, protocol::PLAY_BEEP_RESULT, timeout).await }
         }))
         .await;
         results.into_iter().find(|result| result.is_err()).unwrap_or(Ok(()))
+    }
+
+    async fn beep_start(&self, group: CardGroup, tone: Tone) -> HwResult<()> {
+        let links = self.beep_links(group)?;
+        let command = protocol::play_beep(tone);
+        for link in links {
+            let command = command.clone();
+            // Still collect the reply in the background, so it can't be
+            // mistaken for the reply to a later beep.
+            tokio::spawn(async move {
+                let _ = link.sound_command(&command, protocol::PLAY_BEEP_RESULT, REPLY_TIMEOUT).await;
+            });
+        }
+        Ok(())
     }
 
     async fn reset_motor_positions(&self) -> HwResult<()> {
@@ -765,11 +863,15 @@ impl LegoDevice for LegoBleDevice {
     }
 
     async fn stop_all(&self) -> HwResult<()> {
-        // Fire-and-forget so STOP is never held up by a slow device.
-        let stops = self.links().into_iter().filter_map(|link| {
-            let mask = motor_stop_mask(link.kind)?;
-            link.last_run.lock().unwrap_or_else(|e| e.into_inner()).clear();
-            Some(async move { link.write(&protocol::motor_stop(mask)).await })
+        // Fire-and-forget so STOP is never held up by a slow device. Every
+        // device can beep, so all of them also get "stop sound".
+        let stops = self.links().into_iter().map(|link| {
+            let mut data = protocol::stop_sound();
+            if let Some(mask) = motor_stop_mask(link.kind) {
+                link.last_run.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                data.extend(protocol::motor_stop(mask));
+            }
+            async move { link.write(&data).await }
         });
         let results = futures::future::join_all(stops).await;
         results.into_iter().find(|r| r.is_err()).unwrap_or(Ok(()))

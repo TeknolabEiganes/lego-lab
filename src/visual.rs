@@ -6,16 +6,31 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::hardware::{CardGroup, Direction, Motor};
+use crate::audio::{self, SoundOutput};
+use crate::hardware::{BeepPattern, CardGroup, Direction, Motor};
 use crate::program::condition::Condition;
+use crate::program::tune::{self, Tune};
 
 pub type BlockId = u64;
 
 pub const MAX_SECONDS: f32 = 3600.0;
 pub const MAX_ROTATIONS: f32 = 1000.0;
 pub const MAX_REPEAT: u32 = 10_000;
+pub const MAX_BEEP_COUNT: u32 = 10;
 /// Deepest nesting a loaded file may contain.
 pub const MAX_DEPTH: usize = 32;
+
+fn default_note() -> u8 {
+    tune::DEFAULT_NOTE
+}
+
+fn one() -> u32 {
+    1
+}
+
+fn full_volume() -> u32 {
+    audio::DEFAULT_VOLUME
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Category {
@@ -24,6 +39,33 @@ pub enum Category {
     Sounds,
     Control,
     Sensors,
+}
+
+/// How a motor block drives the motor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum DriveMode {
+    /// The motor holds a steady speed, adding power under load.
+    #[default]
+    Speed,
+    /// Fixed power (duty cycle), no speed regulation. Faster at 100%, but
+    /// slows down under load.
+    Power,
+}
+
+impl DriveMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            DriveMode::Speed => "speed",
+            DriveMode::Power => "power",
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            DriveMode::Speed => DriveMode::Power,
+            DriveMode::Power => DriveMode::Speed,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,12 +77,23 @@ pub enum BlockKind {
         #[serde(default)]
         group: CardGroup,
         direction: Direction,
+        #[serde(default)]
+        mode: DriveMode,
+        /// Speed or power in percent, depending on `mode`.
         speed: i32,
     },
     StopMotor {
         motor: Motor,
         #[serde(default)]
         group: CardGroup,
+    },
+    /// How quickly motors speed up and slow down (0–100 each).
+    SetAcceleration {
+        motor: Motor,
+        #[serde(default)]
+        group: CardGroup,
+        acceleration: i32,
+        deceleration: i32,
     },
     ResetPosition {
         motor: Motor,
@@ -52,6 +105,9 @@ pub enum BlockKind {
         #[serde(default)]
         group: CardGroup,
         direction: Direction,
+        #[serde(default)]
+        mode: DriveMode,
+        /// Speed or power in percent, depending on `mode`.
         speed: i32,
         seconds: f32,
     },
@@ -66,6 +122,28 @@ pub enum BlockKind {
     Beep {
         #[serde(default)]
         group: CardGroup,
+        #[serde(default)]
+        pattern: BeepPattern,
+        /// MIDI note, one of [`tune::NOTES`].
+        #[serde(default = "default_note")]
+        note: u8,
+        #[serde(default = "one")]
+        count: u32,
+        /// Devices, this computer, or both.
+        #[serde(default)]
+        output: SoundOutput,
+        /// Loudness on the computer, 0–100% (the devices have no volume).
+        #[serde(default = "full_volume")]
+        volume: u32,
+    },
+    PlayTune {
+        #[serde(default)]
+        group: CardGroup,
+        tune: Tune,
+        #[serde(default)]
+        output: SoundOutput,
+        #[serde(default = "full_volume")]
+        volume: u32,
     },
     Wait {
         seconds: f32,
@@ -90,15 +168,30 @@ impl BlockKind {
     pub fn palette() -> Vec<BlockKind> {
         let motor = Motor::Single;
         let direction = Direction::Clockwise;
+        let mode = DriveMode::Speed;
         let condition = Condition::default();
         vec![
             BlockKind::WhenRun,
-            BlockKind::RunMotor { motor, group: CardGroup::NoCard, direction, speed: 50 },
+            BlockKind::RunMotor { motor, group: CardGroup::NoCard, direction, mode, speed: 50 },
             BlockKind::StopMotor { motor, group: CardGroup::NoCard },
-            BlockKind::MotorForTime { motor, group: CardGroup::NoCard, direction, speed: 50, seconds: 1.0 },
+            BlockKind::MotorForTime { motor, group: CardGroup::NoCard, direction, mode, speed: 50, seconds: 1.0 },
             BlockKind::MotorRotations { motor, group: CardGroup::NoCard, direction, speed: 50, rotations: 1.0 },
+            BlockKind::SetAcceleration { motor, group: CardGroup::NoCard, acceleration: 100, deceleration: 100 },
             BlockKind::ResetPosition { motor, group: CardGroup::NoCard },
-            BlockKind::Beep { group: CardGroup::NoCard },
+            BlockKind::Beep {
+                group: CardGroup::NoCard,
+                pattern: BeepPattern::Single,
+                note: tune::PALETTE_NOTE,
+                count: 1,
+                output: SoundOutput::Devices,
+                volume: audio::DEFAULT_VOLUME,
+            },
+            BlockKind::PlayTune {
+                group: CardGroup::NoCard,
+                tune: Tune::default(),
+                output: SoundOutput::Devices,
+                volume: audio::DEFAULT_VOLUME,
+            },
             BlockKind::Wait { seconds: 1.0 },
             BlockKind::Repeat { count: 4 },
             BlockKind::Forever,
@@ -115,8 +208,9 @@ impl BlockKind {
             | BlockKind::StopMotor { .. }
             | BlockKind::ResetPosition { .. }
             | BlockKind::MotorForTime { .. }
-            | BlockKind::MotorRotations { .. } => Category::Motors,
-            BlockKind::Beep { .. } => Category::Sounds,
+            | BlockKind::MotorRotations { .. }
+            | BlockKind::SetAcceleration { .. } => Category::Motors,
+            BlockKind::Beep { .. } | BlockKind::PlayTune { .. } => Category::Sounds,
             BlockKind::Wait { .. }
             | BlockKind::WaitUntil { .. }
             | BlockKind::Repeat { .. }
@@ -171,7 +265,9 @@ impl BlockKind {
             BlockKind::ResetPosition { .. } => "Reset Position",
             BlockKind::MotorForTime { .. } => "Motor for Time",
             BlockKind::MotorRotations { .. } => "Motor Rotations",
+            BlockKind::SetAcceleration { .. } => "Set Acceleration",
             BlockKind::Beep { .. } => "Beep",
+            BlockKind::PlayTune { .. } => "Play Tune",
             BlockKind::Wait { .. } => "Wait",
             BlockKind::WaitUntil { .. } => "Wait Until",
             BlockKind::Repeat { .. } => "Repeat",
@@ -188,7 +284,9 @@ impl BlockKind {
             BlockKind::StopMotor { .. } => "■",
             BlockKind::ResetPosition { .. } => "⟲",
             BlockKind::MotorRotations { .. } => "⟳",
+            BlockKind::SetAcceleration { .. } => "⏩",
             BlockKind::Beep { .. } => "♫",
+            BlockKind::PlayTune { .. } => "🎵",
             BlockKind::Wait { .. } | BlockKind::WaitUntil { .. } => "⏱",
             BlockKind::Repeat { .. } | BlockKind::Forever => "🔁",
             BlockKind::If { .. } | BlockKind::IfElse { .. } => "❓",
@@ -205,9 +303,18 @@ impl BlockKind {
             BlockKind::WhenRun
             | BlockKind::StopMotor { .. }
             | BlockKind::ResetPosition { .. }
-            | BlockKind::Beep { .. }
             | BlockKind::Forever => {}
+            BlockKind::PlayTune { volume, .. } => *volume = (*volume).min(100),
+            BlockKind::Beep { note, count, volume, .. } => {
+                *note = tune::nearest_note(*note);
+                *count = (*count).clamp(1, MAX_BEEP_COUNT);
+                *volume = (*volume).min(100);
+            }
             BlockKind::RunMotor { speed, .. } => *speed = (*speed).clamp(0, 100),
+            BlockKind::SetAcceleration { acceleration, deceleration, .. } => {
+                *acceleration = (*acceleration).clamp(0, 100);
+                *deceleration = (*deceleration).clamp(0, 100);
+            }
             BlockKind::MotorForTime { speed, seconds, .. } => {
                 *speed = (*speed).clamp(0, 100);
                 secs(seconds);
@@ -319,7 +426,7 @@ impl Workspace {
         let motor = Motor::Single;
         let blocks = vec![
             ws.make_block(BlockKind::WhenRun),
-            ws.make_block(BlockKind::RunMotor { motor, group: CardGroup::NoCard, direction: Direction::Clockwise, speed: 50 }),
+            ws.make_block(BlockKind::RunMotor { motor, group: CardGroup::NoCard, direction: Direction::Clockwise, mode: DriveMode::Speed, speed: 50 }),
             ws.make_block(BlockKind::Wait { seconds: 2.0 }),
             ws.make_block(BlockKind::StopMotor { motor, group: CardGroup::NoCard }),
         ];
@@ -467,6 +574,43 @@ impl Workspace {
         }
     }
 
+    /// Visit the condition of every block.
+    pub fn for_each_condition_mut(&mut self, mut f: impl FnMut(&mut Condition)) {
+        fn visit(seq: &mut [Block], f: &mut impl FnMut(&mut Condition)) {
+            for b in seq {
+                if let Some(c) = b.kind.condition_mut() {
+                    f(c);
+                }
+                visit(&mut b.body, f);
+                visit(&mut b.else_body, f);
+            }
+        }
+        for s in &mut self.stacks {
+            visit(&mut s.blocks, &mut f);
+        }
+    }
+
+    /// A trained camera pose was deleted: blocks using later poses follow
+    /// them to their new position, blocks using the deleted one look for a
+    /// person instead. Returns whether any block used the deleted pose.
+    pub fn remove_camera_pose(&mut self, removed: u8) -> bool {
+        use crate::camera::CameraPose;
+        let mut used = false;
+        self.for_each_condition_mut(|c| {
+            if let Condition::Camera { pose } = c
+                && let CameraPose::Custom(i) = *pose
+            {
+                if i == removed {
+                    used = true;
+                    *pose = CameraPose::Person;
+                } else if i > removed {
+                    *pose = CameraPose::Custom(i - 1);
+                }
+            }
+        });
+        used
+    }
+
     pub fn add_stack(&mut self, pos: [f32; 2], blocks: Vec<Block>) {
         if !blocks.is_empty() {
             self.stacks.push(Stack { pos, blocks });
@@ -567,7 +711,7 @@ pub(crate) mod tests {
         let mut if_else = ws.make_block(BlockKind::IfElse {
             condition: Condition::ColorIs { color: crate::hardware::LegoColor::Red, group: CardGroup::NoCard },
         });
-        if_else.body.push(ws.make_block(BlockKind::RunMotor { motor, group: CardGroup::NoCard, direction: Direction::Clockwise, speed: 100 }));
+        if_else.body.push(ws.make_block(BlockKind::RunMotor { motor, group: CardGroup::NoCard, direction: Direction::Clockwise, mode: DriveMode::Speed, speed: 100 }));
         if_else.else_body.push(ws.make_block(BlockKind::StopMotor { motor, group: CardGroup::NoCard }));
         forever.body.push(if_else);
         ws.add_stack([0.0, 0.0], vec![hat, forever]);
@@ -651,6 +795,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn deleting_a_camera_pose_renumbers_blocks() {
+        use crate::camera::CameraPose;
+        let mut ws = Workspace::new();
+        let hat = ws.make_block(BlockKind::WhenRun);
+        let a = ws.make_block(BlockKind::WaitUntil { condition: Condition::Camera { pose: CameraPose::Custom(0) } });
+        let b = ws.make_block(BlockKind::WaitUntil { condition: Condition::Camera { pose: CameraPose::Custom(2) } });
+        ws.add_stack([0.0, 0.0], vec![hat, a, b]);
+        assert!(ws.remove_camera_pose(0));
+        let poses: Vec<_> = ws.stacks[0].blocks[1..].iter().map(|b| *b.kind.condition().unwrap()).collect();
+        assert_eq!(
+            poses,
+            vec![Condition::Camera { pose: CameraPose::Person }, Condition::Camera { pose: CameraPose::Custom(1) }]
+        );
+        assert!(!ws.remove_camera_pose(5));
+    }
+
+    #[test]
     fn sanitize_repairs_bad_input() {
         let json = r#"{"stacks":[{"pos":[0,0],"blocks":[
             {"id":1,"type":"run_motor","motor":"Single","direction":"Clockwise","speed":9000},
@@ -665,7 +826,7 @@ pub(crate) mod tests {
         assert_eq!(ws.stacks.len(), 3, "hat and forever split the stack");
         assert_eq!(
             ws.stacks[0].blocks[0].kind,
-            BlockKind::RunMotor { motor: Motor::Single, group: CardGroup::NoCard, direction: Direction::Clockwise, speed: 100 }
+            BlockKind::RunMotor { motor: Motor::Single, group: CardGroup::NoCard, direction: Direction::Clockwise, mode: DriveMode::Speed, speed: 100 }
         );
         let wait = &ws.stacks[1].blocks[1];
         assert_eq!(wait.kind, BlockKind::Wait { seconds: 0.0 });

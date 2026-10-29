@@ -11,7 +11,7 @@ use async_trait::async_trait;
 
 use super::{
     AttachedDevice, CardGroup, ConnectionState, DeviceKind, Direction, HardwareError, HwResult, LegoColor,
-    LegoDevice, Lever, Motor, SensorQuery, SensorValue, Speed,
+    LegoDevice, Lever, Motor, SensorQuery, SensorValue, Speed, Tone,
 };
 
 /// Degrees per second per 1% of speed (100% ≈ 1000°/s).
@@ -364,6 +364,53 @@ impl LegoDevice for MockDevice {
             .await
     }
 
+    async fn motor_run_power(&self, motor: Motor, group: CardGroup, direction: Direction, power: u8) -> HwResult<()> {
+        // No load in the simulator, so fixed power behaves like the same speed.
+        self.with_state(|s| {
+            s.check(motor.device(), group)?;
+            let signed = Speed::new(power as i64).signed(direction);
+            let changed = s.motor_speeds(motor).iter().any(|v| *v != signed);
+            s.set_motor(motor, signed);
+            if changed {
+                s.log(format!("{} → {}% power", motor.label(), signed));
+            }
+            Ok(())
+        })
+    }
+
+    async fn motor_run_power_for_time(
+        &self,
+        motor: Motor,
+        group: CardGroup,
+        direction: Direction,
+        power: u8,
+        duration: Duration,
+    ) -> HwResult<()> {
+        // No load in the simulator, so fixed power behaves like the same speed.
+        let speed = Speed::new(power as i64);
+        let text = format!(
+            "{} → {}% power for {:.1} s",
+            motor.label(),
+            speed.signed(direction),
+            duration.as_secs_f64()
+        );
+        self.timed(motor, group, direction, speed, duration, text).await
+    }
+
+    async fn motor_set_acceleration(
+        &self,
+        motor: Motor,
+        group: CardGroup,
+        acceleration: u8,
+        deceleration: u8,
+    ) -> HwResult<()> {
+        self.with_state(|s| {
+            s.check(motor.device(), group)?;
+            s.log(format!("{} → acceleration {acceleration}%, deceleration {deceleration}%", motor.label()));
+            Ok(())
+        })
+    }
+
     async fn motor_stop(&self, motor: Motor, group: CardGroup) -> HwResult<()> {
         self.with_state(|s| {
             s.check(motor.device(), group)?;
@@ -398,12 +445,17 @@ impl LegoDevice for MockDevice {
         })
     }
 
-    async fn beep(&self, group: CardGroup) -> HwResult<()> {
+    async fn beep(&self, group: CardGroup, tone: Tone) -> HwResult<()> {
         self.with_state(|s| {
             s.check_group(group)?;
-            s.log(format!("Beep on {} group", group.label()));
+            let times = if tone.count > 1 { format!(" ×{}", tone.count) } else { String::new() };
+            s.log(format!("{} {} Hz{times} on {} group", tone.pattern.label(), tone.frequency, group.label()));
             Ok(())
         })
+    }
+
+    async fn beep_start(&self, group: CardGroup, tone: Tone) -> HwResult<()> {
+        self.beep(group, tone).await
     }
 
     async fn reset_motor_positions(&self) -> HwResult<()> {
@@ -534,8 +586,8 @@ mod tests {
             }
         });
 
-        assert_eq!(dev.beep(CardGroup::NoCard).await.unwrap_err(), HardwareError::DeviceGroupMissing(CardGroup::NoCard));
-        dev.beep(CardGroup::Blue).await.unwrap();
+        assert_eq!(dev.beep(CardGroup::NoCard, Tone::default()).await.unwrap_err(), HardwareError::DeviceGroupMissing(CardGroup::NoCard));
+        dev.beep(CardGroup::Blue, Tone::default()).await.unwrap();
         assert!(dev.with_state(|s| s.log.back().unwrap().text.contains("Blue card")));
     }
 }

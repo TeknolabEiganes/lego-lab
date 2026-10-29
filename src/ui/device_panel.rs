@@ -24,6 +24,7 @@ pub fn status_bar(
     mode: Backend,
     show_blocks: bool,
     show_right_panel: bool,
+    camera_on: bool,
     icons: &IconTextures,
 ) -> Vec<ToolbarAction> {
     let mut actions = Vec::new();
@@ -67,6 +68,14 @@ pub fn status_bar(
                 let text = RichText::new(kind.label()).color(if found { theme::TEXT } else { theme::TEXT_MUTED });
                 ui.label(text).on_hover_text(hover);
                 ui.add_space(10.0);
+            }
+        }
+        if camera_on {
+            let camera = ui
+                .add(egui::Button::new(RichText::new("📷 Camera on").color(theme::STOP_RED)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE))
+                .on_hover_text("The camera is on (Ctrl/Cmd+3 shows it)");
+            if camera.clicked() {
+                actions.push(ToolbarAction::ShowCamera);
             }
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

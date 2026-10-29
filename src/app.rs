@@ -9,12 +9,16 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 
+use crate::audio::{ComputerSpeaker, Speaker};
+use crate::camera::pose::MAX_EXAMPLES;
+use crate::camera::{Camera, PoseClass};
 use crate::executor::{ExecEvent, Executor, RunOutcome};
 use crate::hardware::lego::LegoBleDevice;
 use crate::hardware::mock::MockDevice;
 use crate::hardware::{AttachedDevice, CardGroup, ConnectionState, HwResult, LegoDevice};
 use crate::program::compiler;
 use crate::project::{self, Project};
+use crate::ui::camera_panel::{self, CameraAction, Preview};
 use crate::ui::canvas::{self, CanvasInfo, Editor};
 use crate::ui::device_panel::{self, HardwareView, PanelAction, StatusLine};
 use crate::ui::toolbar::{self, Backend, ToolbarAction, ToolbarState};
@@ -22,6 +26,8 @@ use crate::ui::{icons::IconTextures, palette, theme};
 use crate::visual::{BlockId, Workspace};
 
 const HIGHLIGHT_LINGER: Duration = Duration::from_millis(180);
+/// While Record is held, add a camera example this often.
+const RECORD_INTERVAL: Duration = Duration::from_millis(120);
 const LAST_PROJECT_FILE: &str = "last-project";
 
 fn app_config_dir() -> Option<PathBuf> {
@@ -60,6 +66,14 @@ struct RunHandle {
     events: UnboundedReceiver<ExecEvent>,
 }
 
+/// What the right-hand pane shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RightPane {
+    /// The simulator or the Bluetooth devices, depending on the backend.
+    Devices,
+    Camera,
+}
+
 pub struct LegoLabApp {
     rt: Runtime,
     mock: MockDevice,
@@ -86,7 +100,19 @@ pub struct LegoLabApp {
     hw_rx: UnboundedReceiver<HwMsg>,
     show_blocks: bool,
     show_right_panel: bool,
+    right_pane: RightPane,
     device_filter: Option<CardGroup>,
+
+    camera: Camera,
+    camera_preview: Preview,
+    /// Poses taught to the camera; saved with the project.
+    poses: Vec<PoseClass>,
+    /// The camera was switched on by RUN (not by the user) and goes off
+    /// again when the program ends.
+    camera_for_run: bool,
+    last_record: Instant,
+    /// Sound blocks set to play on this computer.
+    speaker: ComputerSpeaker,
 }
 
 impl LegoLabApp {
@@ -123,7 +149,14 @@ impl LegoLabApp {
             hw_rx,
             show_blocks: true,
             show_right_panel: true,
+            right_pane: RightPane::Devices,
             device_filter: None,
+            camera: Camera::new(),
+            camera_preview: Preview::default(),
+            poses: Vec::new(),
+            camera_for_run: false,
+            last_record: Instant::now(),
+            speaker: ComputerSpeaker::new(),
         };
         let explicit_path = open_path.is_some();
         if let Some(path) = open_path.or_else(read_last_project_path) {
@@ -193,6 +226,7 @@ impl LegoLabApp {
             Backend::Bluetooth => Arc::new(self.ble.clone()),
         };
         self.show_right_panel = true;
+        self.right_pane = RightPane::Devices;
         match backend {
             // The simulator is always there: connect straight away.
             Backend::Simulator => self.connect(ctx),
@@ -322,7 +356,8 @@ impl LegoLabApp {
                 return;
             }
         };
-        if self.device.connection() != ConnectionState::Connected {
+        let needs_lego = !compiled.devices.is_empty() || !compiled.groups.is_empty();
+        if needs_lego && self.device.connection() != ConnectionState::Connected {
             self.error("Not connected. Press Connect first.");
             return;
         }
@@ -352,9 +387,34 @@ impl LegoLabApp {
             return;
         }
 
+        let trained = self.poses.iter().filter(|p| !p.examples.is_empty()).count();
+        for (&pose, &block) in &compiled.custom_poses {
+            let problem = match self.poses.get(pose as usize) {
+                None => Some("This block looks for a camera pose that doesn't exist. Pick another one.".to_string()),
+                Some(p) if p.examples.is_empty() => {
+                    Some(format!("“{}” has no examples yet. Record some in the Camera pane.", p.name))
+                }
+                Some(_) if trained < 2 => {
+                    Some("Teach the camera at least two poses, so it can tell them apart.".to_string())
+                }
+                Some(_) => None,
+            };
+            if let Some(message) = problem {
+                self.error_block = Some(block);
+                self.error(message);
+                return;
+            }
+        }
+        if compiled.uses_camera && !self.camera.is_on() {
+            self.camera.start(ctx.clone());
+            self.camera_for_run = true;
+        }
+
         let cancel = CancellationToken::new();
         let (tx, rx) = unbounded_channel();
-        let executor = Executor::new(self.device.clone());
+        let executor = Executor::new(self.device.clone())
+            .with_camera(Arc::new(self.camera.clone()))
+            .with_speaker(Arc::new(self.speaker.clone()));
         let program = compiled.program;
         let token = cancel.clone();
         let ctx2 = ctx.clone();
@@ -385,10 +445,85 @@ impl LegoLabApp {
         }
         self.active.clear();
         self.recent.clear();
+        self.release_camera_after_run();
+        self.speaker.stop();
         let device = self.device.clone();
         self.rt.spawn(async move {
             let _ = device.stop_all().await;
         });
+    }
+
+    /// Switch off a camera that RUN switched on, unless the Camera pane is
+    /// showing it.
+    fn release_camera_after_run(&mut self) {
+        if std::mem::take(&mut self.camera_for_run) && !self.camera_pane_visible() {
+            self.camera.stop();
+        }
+    }
+
+    fn camera_pane_visible(&self) -> bool {
+        self.show_right_panel && self.right_pane == RightPane::Camera
+    }
+
+    // ---- camera ---------------------------------------------------------
+
+    fn set_poses(&mut self, poses: Vec<PoseClass>) {
+        self.poses = poses;
+        self.camera.set_classes(&self.poses);
+    }
+
+    fn poses_changed(&mut self) {
+        self.camera.set_classes(&self.poses);
+        self.dirty = true;
+    }
+
+    fn camera_action(&mut self, action: CameraAction, ctx: &egui::Context) {
+        match action {
+            CameraAction::TurnOn => {
+                self.camera.start(ctx.clone());
+                self.camera_for_run = false;
+            }
+            CameraAction::TurnOff => {
+                self.camera.stop();
+                self.camera_for_run = false;
+            }
+            CameraAction::AddPose => {
+                let n = (1..).find(|n| !self.poses.iter().any(|p| p.name == format!("pose {n}"))).unwrap_or(1);
+                self.poses.push(PoseClass::new(format!("pose {n}")));
+                self.poses_changed();
+            }
+            CameraAction::Renamed => self.poses_changed(),
+            CameraAction::ClearPose(i) => {
+                if let Some(p) = self.poses.get_mut(i) {
+                    p.examples.clear();
+                    self.poses_changed();
+                }
+            }
+            CameraAction::DeletePose(i) => {
+                if i < self.poses.len() {
+                    let removed = self.poses.remove(i);
+                    if self.editor.ws.remove_camera_pose(i as u8) {
+                        self.info(format!("Deleted “{}”. Blocks that used it now look for a person.", removed.name));
+                    }
+                    self.poses_changed();
+                }
+            }
+            CameraAction::Record(i) => {
+                if self.last_record.elapsed() < RECORD_INTERVAL {
+                    return;
+                }
+                let Some(class) = self.poses.get_mut(i) else { return };
+                match self.camera.current_pose() {
+                    Some(pose) if class.examples.len() < MAX_EXAMPLES => {
+                        class.examples.push(pose);
+                        self.last_record = Instant::now();
+                        self.poses_changed();
+                    }
+                    Some(_) => {}
+                    None => self.info("Step in front of the camera so it can see you."),
+                }
+            }
+        }
     }
 
     fn handle_exec_events(&mut self) {
@@ -410,6 +545,7 @@ impl LegoLabApp {
             self.run = None;
             self.active.clear();
             self.recent.clear();
+            self.release_camera_after_run();
             match outcome {
                 RunOutcome::Completed => self.info("Program finished"),
                 RunOutcome::Stopped => self.info("Stopped"),
@@ -423,6 +559,7 @@ impl LegoLabApp {
     fn new_project(&mut self) {
         self.stop();
         self.editor = Editor::new(Workspace::new());
+        self.set_poses(Vec::new());
         self.project_name = "My Robot".into();
         self.path = None;
         self.dirty = false;
@@ -449,6 +586,7 @@ impl LegoLabApp {
             Ok(p) => {
                 self.stop();
                 self.editor = Editor::new(p.workspace);
+                self.set_poses(p.poses);
                 self.project_name = p.name;
                 self.info(format!("Opened {}", path.display()));
                 remember_last_project(&path);
@@ -476,7 +614,7 @@ impl LegoLabApp {
                 }
             }
         };
-        let project = Project::new(self.project_name.clone(), self.editor.ws.clone());
+        let project = Project { poses: self.poses.clone(), ..Project::new(self.project_name.clone(), self.editor.ws.clone()) };
         match project.save(&path) {
             Ok(()) => {
                 self.info(format!("Saved {}", path.display()));
@@ -498,6 +636,7 @@ impl LegoLabApp {
         let toggle_blocks = KeyboardShortcut::new(Modifiers::COMMAND, Key::Num1);
         let toggle_right_panel = KeyboardShortcut::new(Modifiers::COMMAND, Key::Num2);
         let toggle_panes = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
+        let show_camera = KeyboardShortcut::new(Modifiers::COMMAND, Key::Num3);
         let run = KeyboardShortcut::new(Modifiers::NONE, Key::F5);
         ctx.input_mut(|i| {
             if i.consume_shortcut(&save_as) {
@@ -520,6 +659,9 @@ impl LegoLabApp {
             }
             if i.consume_shortcut(&toggle_panes) {
                 out.push(ToolbarAction::TogglePanes);
+            }
+            if i.consume_shortcut(&show_camera) {
+                out.push(ToolbarAction::ShowCamera);
             }
             if i.consume_shortcut(&run) {
                 out.push(ToolbarAction::Run);
@@ -550,6 +692,14 @@ impl LegoLabApp {
                 let show = !(self.show_blocks || self.show_right_panel);
                 self.show_blocks = show;
                 self.show_right_panel = show;
+            }
+            ToolbarAction::ShowCamera => {
+                if self.camera_pane_visible() {
+                    self.show_right_panel = false;
+                } else {
+                    self.show_right_panel = true;
+                    self.right_pane = RightPane::Camera;
+                }
             }
         }
     }
@@ -601,6 +751,7 @@ impl eframe::App for LegoLabApp {
                     self.backend,
                     self.show_blocks,
                     self.show_right_panel,
+                    self.camera.is_on(),
                     &self.icons,
                 ));
             });
@@ -617,24 +768,38 @@ impl eframe::App for LegoLabApp {
         }
 
         let mut panel_actions = Vec::new();
+        let mut camera_actions = Vec::new();
         if self.show_right_panel {
             egui::Panel::right("simulator")
                 .default_size(300.0)
                 .size_range(260.0..=420.0)
                 .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(10))
-                .show(ui, |ui| match self.backend {
-                    Backend::Simulator => device_panel::simulator_panel(ui, &self.mock),
-                    Backend::Bluetooth => {
-                        let view = HardwareView {
-                            connection,
-                            busy: self.ble.is_busy(),
-                            found: &self.ble.last_scan(),
-                            connected: &self.ble.connected_addresses(),
-                            live: &self.device.snapshot(),
-                            filter: self.device_filter,
-                        };
-                        if let Some(action) = device_panel::hardware_panel(ui, view, &self.icons) {
-                            panel_actions.push(action);
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let devices = if self.backend == Backend::Simulator { "Simulator" } else { "Devices" };
+                        ui.selectable_value(&mut self.right_pane, RightPane::Devices, devices)
+                            .on_hover_text("Ctrl/Cmd+2");
+                        ui.selectable_value(&mut self.right_pane, RightPane::Camera, "📷 Camera")
+                            .on_hover_text("Ctrl/Cmd+3");
+                    });
+                    ui.separator();
+                    match (self.right_pane, self.backend) {
+                        (RightPane::Camera, _) => {
+                            camera_actions = camera_panel::camera_panel(ui, &self.camera, &mut self.camera_preview, &mut self.poses);
+                        }
+                        (RightPane::Devices, Backend::Simulator) => device_panel::simulator_panel(ui, &self.mock),
+                        (RightPane::Devices, Backend::Bluetooth) => {
+                            let view = HardwareView {
+                                connection,
+                                busy: self.ble.is_busy(),
+                                found: &self.ble.last_scan(),
+                                connected: &self.ble.connected_addresses(),
+                                live: &self.device.snapshot(),
+                                filter: self.device_filter,
+                            };
+                            if let Some(action) = device_panel::hardware_panel(ui, view, &self.icons) {
+                                panel_actions.push(action);
+                            }
                         }
                     }
                 });
@@ -644,7 +809,8 @@ impl eframe::App for LegoLabApp {
             self.recent.retain(|_, t| t.elapsed() < HIGHLIGHT_LINGER);
             let mut lit = self.active.clone();
             lit.extend(self.recent.keys().copied());
-            let info = CanvasInfo { active: &lit, error_block: self.error_block };
+            let pose_names: Vec<String> = self.poses.iter().map(|p| p.name.clone()).collect();
+            let info = CanvasInfo { active: &lit, error_block: self.error_block, poses: &pose_names };
             if canvas::show(ui, &mut self.editor, &info) {
                 self.dirty = true;
                 self.error_block = None;
@@ -656,6 +822,9 @@ impl eframe::App for LegoLabApp {
         }
         for action in panel_actions {
             self.panel_action(action, &ctx);
+        }
+        for action in camera_actions {
+            self.camera_action(action, &ctx);
         }
 
         let title = format!(
@@ -677,6 +846,8 @@ impl eframe::App for LegoLabApp {
         if let Some(run) = self.run.take() {
             run.cancel.cancel();
         }
+        self.camera.stop();
+        self.speaker.stop();
         let device = self.device.clone();
         let _ = self.rt.block_on(async move {
             tokio::time::timeout(Duration::from_secs(2), async {

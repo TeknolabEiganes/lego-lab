@@ -20,7 +20,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 btleplug = "0.13"
 futures = "0.3"
 uuid = "1"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Camera: webcam capture and the MoveNet body-pose model.
+v4l = "0.14"
+tract-onnx = "0.23"
+# Sound on the computer (Beep / Play Tune "on this computer").
+rodio = { version = "0.23", default-features = false, features = ["playback"] }
 
 [profile.release]
 opt-level = 3

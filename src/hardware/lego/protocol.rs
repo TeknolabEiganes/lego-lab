@@ -4,7 +4,7 @@
 //! `legoeducation` Python package (RPC 2.0); see docs/lego-hardware.md.
 //! Messages are `[id: u8][payload…]`, little-endian, with no extra framing.
 
-use super::super::{DeviceKind, Direction, LegoColor, Motor};
+use super::super::{BeepPattern, DeviceKind, Direction, LegoColor, MAX_BEEP_HZ, Motor, Tone};
 
 /// Protocol versions we speak. 1.0 (firmware 1.0.73, legoeducation 1.0.x)
 /// and 2.0 (legoeducation 1.1.x) have byte-identical message definitions.
@@ -17,7 +17,7 @@ pub const DEVICE_NOTIFICATION_RESPONSE: u8 = 41;
 pub const DEVICE_NOTIFICATION: u8 = 60;
 pub const PLAY_BEEP: u8 = 112;
 pub const PLAY_BEEP_RESULT: u8 = 113;
-pub const SOUND_PATTERN_BEEP_SINGLE: u8 = 0;
+pub const STOP_SOUND: u8 = 114;
 pub const MOTOR_RESET_RELATIVE_POSITION: u8 = 120;
 pub const MOTOR_RESET_RELATIVE_POSITION_RESULT: u8 = 121;
 pub const MOTOR_RUN: u8 = 122;
@@ -29,6 +29,10 @@ pub const MOTOR_RUN_FOR_TIME_RESULT: u8 = 127;
 pub const MOTOR_STOP: u8 = 138;
 pub const MOTOR_STOP_RESULT: u8 = 139;
 pub const MOTOR_SET_SPEED: u8 = 140;
+pub const MOTOR_SET_DUTY_CYCLE: u8 = 132;
+pub const MOTOR_SET_DUTY_CYCLE_RESULT: u8 = 133;
+pub const MOTOR_SET_ACCELERATION: u8 = 144;
+pub const MOTOR_SET_ACCELERATION_RESULT: u8 = 145;
 
 /// Motor results (121–145, odd) start with the motor bit mask, so
 /// responses are matched per motor.
@@ -81,6 +85,20 @@ pub fn motor_set_speed(mask: u8, speed: i8) -> Vec<u8> {
     vec![MOTOR_SET_SPEED, mask, speed.clamp(-100, 100) as u8]
 }
 
+/// Drive a motor continuously at `percent` power (−100…100, positive is
+/// clockwise). Sent ×100 on the wire, as LEGO's package does.
+pub fn motor_set_duty_cycle(mask: u8, percent: i8) -> Vec<u8> {
+    let duty = percent.clamp(-100, 100) as i16 * 100;
+    let mut m = vec![MOTOR_SET_DUTY_CYCLE, mask];
+    m.extend_from_slice(&duty.to_le_bytes());
+    m
+}
+
+/// Acceleration and deceleration, 0–100 each.
+pub fn motor_set_acceleration(mask: u8, acceleration: u8, deceleration: u8) -> Vec<u8> {
+    vec![MOTOR_SET_ACCELERATION, mask, acceleration.min(100), deceleration.min(100)]
+}
+
 pub fn motor_run(mask: u8, direction: Direction) -> Vec<u8> {
     vec![MOTOR_RUN, mask, direction_byte(direction)]
 }
@@ -110,12 +128,26 @@ pub fn motor_stop(mask: u8) -> Vec<u8> {
     vec![MOTOR_STOP, mask]
 }
 
-/// Play one default single beep at 440 Hz.
-pub fn play_beep() -> Vec<u8> {
-    let mut message = vec![PLAY_BEEP, SOUND_PATTERN_BEEP_SINGLE];
-    message.extend_from_slice(&440u16.to_le_bytes());
-    message.push(1);
+/// Play a beep pattern `count` times (at least once). The firmware field
+/// counts repeats after the first play, as in LEGO's package.
+pub fn play_beep(tone: Tone) -> Vec<u8> {
+    let mut message = vec![PLAY_BEEP, beep_pattern_byte(tone.pattern)];
+    message.extend_from_slice(&tone.frequency.min(MAX_BEEP_HZ).to_le_bytes());
+    message.push(tone.count.max(1) - 1);
     message
+}
+
+fn beep_pattern_byte(pattern: BeepPattern) -> u8 {
+    match pattern {
+        BeepPattern::Single => 0,
+        BeepPattern::Double => 1,
+        BeepPattern::Triple => 2,
+        BeepPattern::UpMiddleDown => 3,
+    }
+}
+
+pub fn stop_sound() -> Vec<u8> {
+    vec![STOP_SOUND]
 }
 
 // ---- responses ------------------------------------------------------------
@@ -341,13 +373,25 @@ mod tests {
         // struct.pack("<BBB", 140, 1, 50)
         assert_eq!(motor_set_speed(1, 50), [140, 1, 50]);
         assert_eq!(motor_set_speed(3, -100), [140, 3, 0x9c]);
+        assert_eq!(motor_set_duty_cycle(1, 50), [132, 1, 0x88, 0x13], "5000 little-endian");
+        assert_eq!(motor_set_duty_cycle(2, -100), [132, 2, 0xf0, 0xd8], "-10000 little-endian");
+        assert_eq!(motor_set_duty_cycle(1, 127), [132, 1, 0x10, 0x27], "clamped to 10000");
+        assert_eq!(motor_set_acceleration(3, 25, 75), [144, 3, 25, 75]);
+        assert_eq!(motor_set_acceleration(1, 200, 0), [144, 1, 100, 0], "clamped to 100");
         assert_eq!(motor_run(2, Direction::CounterClockwise), [122, 2, 1]);
         // "<BBLB": 2000 ms = d0 07 00 00
         assert_eq!(motor_run_for_time(1, 2000, Direction::Clockwise), [126, 1, 0xd0, 0x07, 0, 0, 0]);
         assert_eq!(motor_run_for_degrees(3, -360, Direction::Clockwise), [124, 3, 0x98, 0xfe, 0xff, 0xff, 0]);
         assert_eq!(motor_stop(3), [138, 3]);
         assert_eq!(motor_reset_relative_position(3, 0), [120, 3, 0, 0, 0, 0]);
-        assert_eq!(play_beep(), [112, SOUND_PATTERN_BEEP_SINGLE, 0xb8, 0x01, 1]);
+        assert_eq!(play_beep(Tone::default()), [112, 0, 0xb8, 0x01, 0], "440 Hz, played once");
+        assert_eq!(
+            play_beep(Tone { pattern: BeepPattern::UpMiddleDown, frequency: 880, count: 3 }),
+            [112, 3, 0x70, 0x03, 2],
+            "repeats after the first play"
+        );
+        assert_eq!(play_beep(Tone { pattern: BeepPattern::Double, frequency: 9000, count: 0 })[2..], [0x8c, 0x0a, 0]);
+        assert_eq!(stop_sound(), [114]);
         assert_eq!(device_notification_request(50), [40, 50, 0]);
         assert_eq!(device_notification_request(5), [40, 15, 0], "clamped to the minimum");
         assert_eq!(motor_mask(Motor::DoubleRight), 2);

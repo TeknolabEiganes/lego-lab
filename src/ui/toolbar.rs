@@ -35,6 +35,8 @@ pub enum ToolbarAction {
     ToggleBlocks,
     TogglePanel,
     TogglePanes,
+    /// Show the Camera pane.
+    ShowCamera,
 }
 
 pub struct ToolbarState<'a> {
